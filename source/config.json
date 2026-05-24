@@ -1,0 +1,6 @@
+{
+    "auto_brightness": true,
+    "startup": false,
+    "model_path": "brightness_model.npz",
+    "log_level": "info"
+}
