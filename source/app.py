@@ -99,6 +99,7 @@ class BrightnessManagerApp:
         self.current_brightness = 50  # 当前亮度值
         self.brightness_data = []  # 亮度数据缓存
         self.auto_brightness_enabled = config_manager.get('auto_brightness', True)  # 自动亮度调整开关，默认开启
+        self.check_interval = config_manager.get('check_interval', 300)  # 循环检查间隔（秒）
         # 获取实际的开机自启动状态
         self.startup_enabled = SystemUtils.get_startup()
         # 更新配置文件
@@ -193,6 +194,52 @@ class BrightnessManagerApp:
             command=self.on_startup_change
         )
         startup_check.pack(anchor=tk.W)
+        
+        # 创建循环检查间隔框架
+        interval_frame = ttk.Frame(settings_frame)
+        interval_frame.pack(fill=tk.X, pady=5)
+        
+        # 创建间隔标签
+        interval_label = ttk.Label(interval_frame, text="循环检查间隔:")
+        interval_label.pack(side=tk.LEFT, padx=5)
+        
+        # 定义间隔选项（秒数，显示文本）
+        self.interval_options = [
+            (60, "1分钟"),
+            (120, "2分钟"),
+            (300, "5分钟"),
+            (600, "10分钟"),
+            (900, "15分钟"),
+            (1800, "30分钟"),
+            (3600, "1小时"),
+            (7200, "2小时"),
+            (14400, "4小时"),
+            (28800, "8小时"),
+            (43200, "12小时"),
+            (86400, "24小时")
+        ]
+        
+        # 创建间隔下拉框
+        self.interval_var = tk.StringVar()
+        interval_combo = ttk.Combobox(
+            interval_frame,
+            textvariable=self.interval_var,
+            values=[text for _, text in self.interval_options],
+            state="readonly",
+            width=10
+        )
+        interval_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 设置当前值
+        current_interval_text = "5分钟"
+        for seconds, text in self.interval_options:
+            if seconds == self.check_interval:
+                current_interval_text = text
+                break
+        self.interval_var.set(current_interval_text)
+        
+        # 绑定选择事件
+        interval_combo.bind("<<ComboboxSelected>>", self.on_interval_change)
     
     def init_neural_network(self):
         """初始化神经网络"""
@@ -461,8 +508,8 @@ class BrightnessManagerApp:
             thread = threading.Thread(target=run_adjust, daemon=True)
             thread.start()
         
-        # 每5分钟执行一次
-        self.auto_adjust_timer = threading.Timer(300, auto_adjust)
+        # 使用配置的间隔执行
+        self.auto_adjust_timer = threading.Timer(self.check_interval, auto_adjust)
         self.auto_adjust_timer.daemon = True
         self.auto_adjust_timer.start()
     
@@ -553,6 +600,19 @@ class BrightnessManagerApp:
             self.log_error("设置开机自启动失败")
             # 使用Tkinter的after方法在主线程显示通知
             self.root.after(0, lambda: Notification("设置开机自启动失败", position='top'))
+    
+    def on_interval_change(self, event):
+        """循环检查间隔变化回调"""
+        selected_text = self.interval_var.get()
+        for seconds, text in self.interval_options:
+            if text == selected_text:
+                self.check_interval = seconds
+                config_manager.set('check_interval', self.check_interval)
+                self.log_info(f"循环检查间隔已设置为: {text}")
+                # 如果自动亮度调整已启用，重启定时任务
+                if self.auto_brightness_enabled:
+                    self.start_auto_adjust_timer()
+                break
     
     def log_info(self, message):
         """记录信息"""

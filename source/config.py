@@ -27,7 +27,8 @@ class ConfigManager:
             'auto_brightness': False,  # 是否自动调整亮度
             'startup': False,  # 是否开机自启动
             'model_path': 'brightness_model.npz',  # 神经网络模型路径（相对于可执行文件）
-            'log_level': 'info'  # 日志级别
+            'log_level': 'info',  # 日志级别
+            'check_interval': 300  # 循环检查间隔（秒），默认5分钟，范围60秒到86400秒
         }
         self.config = self.load_config()
     
