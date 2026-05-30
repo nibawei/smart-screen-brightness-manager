@@ -1,12 +1,38 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+# 添加所有必要的资源文件
+datas = [
+    ('favicon.ico', '.'),
+    ('brightness_model.npz', '.'),
+    ('config.json', '.'),
+]
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('favicon.ico', '.')],
-    hiddenimports=[],
+    datas=datas,
+    hiddenimports=[
+        'cv2', 
+        'numpy', 
+        'PIL', 
+        'PIL.Image',
+        'PIL.ImageTk',
+        'pystray', 
+        'win32api', 
+        'win32con', 
+        'win32event', 
+        'win32gui', 
+        'winerror', 
+        'wmi',
+        'tkinter',
+        'tkinter.ttk',
+        'pythoncom',
+        'PyQt5',
+        'PyQt5.QtWidgets',
+        'PyQt5.QtCore',
+        'PyQt5.QtGui',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

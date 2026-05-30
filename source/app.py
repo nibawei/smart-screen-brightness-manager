@@ -27,6 +27,27 @@ def get_executable_path():
         # 开发环境中的脚本路径
         return os.path.dirname(os.path.abspath(__file__))
 
+# 获取资源文件路径（用于加载打包后的资源）
+def get_resource_path(resource_name):
+    """获取资源文件的正确路径，支持开发和打包环境
+    
+    Args:
+        resource_name: 资源文件名（如 'favicon.ico'）
+        
+    Returns:
+        str: 资源文件的完整路径
+    """
+    if getattr(sys, 'frozen', False):
+        # 打包后，资源会被提取到_MEIPASS目录
+        if hasattr(sys, '_MEIPASS'):
+            return os.path.join(sys._MEIPASS, resource_name)
+        else:
+            # 如果没有_MEIPASS，使用exe目录
+            return os.path.join(get_executable_path(), resource_name)
+    else:
+        # 开发环境中，直接使用当前目录
+        return os.path.join(get_executable_path(), resource_name)
+
 def is_monitor_on():
     """
     Check if the monitor is currently on by querying the power state
@@ -35,7 +56,12 @@ def is_monitor_on():
     try:
         # Method 1: Try using WMI to check monitor status
         try:
-            pythoncom.CoInitialize()  # Initialize COM for this thread
+            # 初始化COM（每次调用都需要初始化，因为可能在不同的线程中）
+            try:
+                pythoncom.CoInitialize()
+            except:
+                pass
+            
             wmi_obj = wmi.WMI(namespace='root\\wmi')
             # Query the monitor power state
             monitor_states = wmi_obj.WmiMonitorBasicDisplayParams()
@@ -54,6 +80,12 @@ def is_monitor_on():
     except Exception:
         # If all methods fail, assume monitor is on to maintain functionality
         return True
+    finally:
+        # 清理COM（确保总是被调用）
+        try:
+            pythoncom.CoUninitialize()
+        except:
+            pass
 
 from liangdu import BrightnessNeuralNetwork, capture_frames_from_camera, calculate_average_brightness, adjust_brightness, generate_synthetic_data
 from config import config_manager
@@ -77,14 +109,7 @@ class BrightnessManagerApp:
         
         # 设置窗口图标
         try:
-            # 尝试加载图标
-            if hasattr(sys, '_MEIPASS'):
-                # 打包后，资源会被提取到_MEIPASS目录
-                icon_path = os.path.join(sys._MEIPASS, "favicon.ico")
-            else:
-                # 开发环境中，直接使用当前目录
-                icon_path = os.path.join(get_executable_path(), "favicon.ico")
-            
+            icon_path = get_resource_path("favicon.ico")
             if os.path.exists(icon_path):
                 self.root.iconbitmap(icon_path)
         except Exception as e:
@@ -245,13 +270,27 @@ class BrightnessManagerApp:
         """初始化神经网络"""
         executable_path = get_executable_path()
         model_path = config_manager.get('model_path', 'brightness_model.npz')
-        model_path = os.path.join(executable_path, model_path)
+        
+        # 优先从用户数据目录查找模型
+        from config import get_user_data_path
+        user_data_path = get_user_data_path()
+        user_model_path = os.path.join(user_data_path, model_path)
+        exe_model_path = os.path.join(executable_path, model_path)
+        
+        # 确定模型路径优先级：用户数据目录 > exe目录
+        if os.path.exists(user_model_path):
+            model_full_path = user_model_path
+        elif os.path.exists(exe_model_path):
+            model_full_path = exe_model_path
+        else:
+            # 都不存在，使用用户数据目录
+            model_full_path = user_model_path
         
         try:
             # 尝试加载已保存的模型
-            if os.path.exists(model_path):
+            if os.path.exists(model_full_path):
                 self.nn = BrightnessNeuralNetwork()
-                self.nn.load_model(model_path)
+                self.nn.load_model(model_full_path)
                 # 检查模型输入大小是否与当前需要的14维特征匹配
                 if self.nn.input_size != 14:
                     self.log_info(f"加载的模型输入大小为{self.nn.input_size}，与当前需要的14维特征不匹配，将重新创建模型")
@@ -259,8 +298,8 @@ class BrightnessManagerApp:
                     self.nn = BrightnessNeuralNetwork()
                     # 预训练模型
                     self.pretrain_network()
-                    # 保存模型
-                    self.nn.save_model(model_path)
+                    # 保存模型到用户数据目录
+                    self.nn.save_model(user_model_path)
                     self.log_info("已创建并预训练神经网络模型")
                 else:
                     self.log_info("已加载神经网络模型")
@@ -269,8 +308,9 @@ class BrightnessManagerApp:
                 self.nn = BrightnessNeuralNetwork()
                 # 预训练模型
                 self.pretrain_network()
-                # 保存模型
-                self.nn.save_model(model_path)
+                # 保存模型到用户数据目录
+                os.makedirs(os.path.dirname(user_model_path), exist_ok=True)
+                self.nn.save_model(user_model_path)
                 self.log_info("已创建并预训练神经网络模型")
         except Exception as e:
             self.log_error(f"初始化神经网络失败: {e}")
@@ -294,14 +334,7 @@ class BrightnessManagerApp:
         try:
             # 加载图标
             try:
-                # 尝试从打包后的资源中加载图标
-                if hasattr(sys, '_MEIPASS'):
-                    # 打包后，资源会被提取到_MEIPASS目录
-                    icon_path = os.path.join(sys._MEIPASS, "favicon.ico")
-                else:
-                    # 开发环境中，直接使用当前目录
-                    icon_path = os.path.join(get_executable_path(), "favicon.ico")
-                
+                icon_path = get_resource_path("favicon.ico")
                 icon = Image.open(icon_path)
             except:
                 # 如果图标不存在或加载失败，创建一个简单的图标
@@ -426,11 +459,15 @@ class BrightnessManagerApp:
             # 训练模型，传递log_callback参数
             self.nn.train(X, y, learning_rate=0.001, epochs=1000, batch_size=32, log_callback=self.log_info)
             
-            # 保存模型
+            # 保存模型到用户数据目录
+            from config import get_user_data_path
             executable_path = get_executable_path()
             model_path = config_manager.get('model_path', 'brightness_model.npz')
-            model_path = os.path.join(executable_path, model_path)
-            self.nn.save_model(model_path)
+            user_data_path = get_user_data_path()
+            user_model_path = os.path.join(user_data_path, model_path)
+            
+            os.makedirs(os.path.dirname(user_model_path), exist_ok=True)
+            self.nn.save_model(user_model_path)
             
             self.log_info("神经网络训练完成并保存")
         except Exception as e:
@@ -834,6 +871,28 @@ def is_single_instance():
     return False
 
 if __name__ == "__main__":
+    # 设置全局异常处理
+    import traceback
+    
+    def global_exception_handler(exctype, value, tb):
+        """全局异常处理器，记录崩溃信息"""
+        error_msg = ''.join(traceback.format_exception(exctype, value, tb))
+        try:
+            from config import get_user_data_path
+            log_path = os.path.join(get_user_data_path(), 'crash.log')
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'='*50}\n")
+                f.write(f"崩溃时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"错误类型: {exctype.__name__}\n")
+                f.write(f"错误信息: {value}\n")
+                f.write(f"堆栈跟踪:\n{error_msg}\n")
+        except:
+            pass
+        print(f"程序崩溃: {error_msg}")
+    
+    # 安装全局异常处理器
+    sys.excepthook = global_exception_handler
+    
     # 检查是否为单实例运行
     if not is_single_instance():
         print("应用程序已经在运行中！")
