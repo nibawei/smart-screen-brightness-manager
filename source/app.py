@@ -136,11 +136,15 @@ class BrightnessManagerApp:
         # 初始化定时任务
         self.auto_adjust_timer = None
         
+        # 模型加载状态
+        self.model_loading = False  # 模型是否正在加载
+        self.model_loaded = False  # 模型是否加载完成
+        
         # 创建GUI
         self.create_gui()
         
-        # 初始化神经网络
-        self.init_neural_network()
+        # 在后台线程中异步初始化神经网络
+        self.init_neural_network_async()
         
         # 启动系统托盘
         self.setup_tray()
@@ -151,9 +155,7 @@ class BrightnessManagerApp:
         # 显示启动通知
         Notification("亮度管理器已启动", position='top')
         
-        # 如果自动亮度调整已启用，启动定时任务
-        if self.auto_brightness_enabled:
-            self.start_auto_adjust_timer()
+        # 注意：自动调整定时任务将在模型加载完成后启动
     
     def create_gui(self):
         """创建GUI界面"""
@@ -205,6 +207,14 @@ class BrightnessManagerApp:
         # 创建训练按钮
         train_button = ttk.Button(button_frame, text="训练", command=self.train_network)
         train_button.pack(side=tk.LEFT, padx=5)
+        
+        # 创建模型加载状态标签
+        self.model_status_label = ttk.Label(
+            brightness_frame, 
+            text="模型状态: 加载中...", 
+            foreground="orange"
+        )
+        self.model_status_label.pack(pady=5)
         
         # 创建设置框架
         settings_frame = ttk.LabelFrame(main_frame, text="设置", padding="10")
@@ -266,8 +276,104 @@ class BrightnessManagerApp:
         # 绑定选择事件
         interval_combo.bind("<<ComboboxSelected>>", self.on_interval_change)
     
+    def init_neural_network_async(self):
+        """在后台线程中异步初始化神经网络"""
+        self.model_loading = True
+        self.log_info("正在后台加载神经网络模型...")
+        
+        # 在后台线程中加载模型
+        threading.Thread(target=self._load_model_in_background, daemon=True).start()
+    
+    def _load_model_in_background(self):
+        """在后台线程中加载模型"""
+        try:
+            executable_path = get_executable_path()
+            model_path = config_manager.get('model_path', 'brightness_model.npz')
+            
+            # 优先从用户数据目录查找模型
+            from config import get_user_data_path
+            user_data_path = get_user_data_path()
+            user_model_path = os.path.join(user_data_path, model_path)
+            exe_model_path = os.path.join(executable_path, model_path)
+            
+            # 确定模型路径优先级：用户数据目录 > exe目录
+            if os.path.exists(user_model_path):
+                model_full_path = user_model_path
+            elif os.path.exists(exe_model_path):
+                model_full_path = exe_model_path
+            else:
+                # 都不存在，使用用户数据目录
+                model_full_path = user_model_path
+            
+            # 尝试加载已保存的模型
+            if os.path.exists(model_full_path):
+                self.nn = BrightnessNeuralNetwork()
+                self.nn.load_model(model_full_path)
+                # 检查模型输入大小是否与当前需要的14维特征匹配
+                if self.nn.input_size != 14:
+                    self.log_info(f"加载的模型输入大小为{self.nn.input_size}，与当前需要的14维特征不匹配，将重新创建模型")
+                    # 创建新模型
+                    self.nn = BrightnessNeuralNetwork()
+                    # 预训练模型
+                    self.pretrain_network()
+                    # 保存模型到用户数据目录
+                    self.nn.save_model(user_model_path)
+                    self.log_info("已创建并预训练神经网络模型")
+                else:
+                    self.log_info("已加载神经网络模型")
+            else:
+                # 如果模型不存在，创建新模型
+                self.nn = BrightnessNeuralNetwork()
+                # 预训练模型
+                self.pretrain_network()
+                # 保存模型到用户数据目录
+                os.makedirs(os.path.dirname(user_model_path), exist_ok=True)
+                self.nn.save_model(user_model_path)
+                self.log_info("已创建并预训练神经网络模型")
+            
+            # 模型加载完成
+            self.model_loading = False
+            self.model_loaded = True
+            
+            # 在主线程中更新UI和启动定时任务
+            self.root.after(0, self._on_model_loaded)
+            
+        except Exception as e:
+            self.log_error(f"初始化神经网络失败: {e}")
+            # 创建默认模型
+            self.nn = BrightnessNeuralNetwork()
+            self.model_loading = False
+            self.model_loaded = True
+            self.root.after(0, self._on_model_loaded)
+    
+    def _on_model_loaded(self):
+        """模型加载完成后的回调（在主线程中执行）"""
+        if self.nn:
+            self.log_info("神经网络模型加载完成")
+            Notification("神经网络模型加载完成", position='top')
+            
+            # 更新模型状态标签
+            self.model_status_label.config(
+                text="模型状态: 已加载",
+                foreground="green"
+            )
+        else:
+            self.log_error("神经网络模型加载失败")
+            Notification("神经网络模型加载失败，部分功能可能不可用", position='top')
+            
+            # 更新模型状态标签为错误状态
+            self.model_status_label.config(
+                text="模型状态: 加载失败",
+                foreground="red"
+            )
+        
+        # 如果自动亮度调整已启用，启动定时任务
+        if self.auto_brightness_enabled and self.nn:
+            self.log_info("启动自动亮度调整定时任务")
+            self.start_auto_adjust_timer()
+    
     def init_neural_network(self):
-        """初始化神经网络"""
+        """初始化神经网络（同步版本，保留用于兼容）"""
         executable_path = get_executable_path()
         model_path = config_manager.get('model_path', 'brightness_model.npz')
         
@@ -378,6 +484,13 @@ class BrightnessManagerApp:
         """显示GUI界面"""
         self.root.deiconify()
         self.root.lift()
+        
+        # 检查模型是否正在加载
+        if self.model_loading:
+            self.log_info("模型正在加载中，请稍后再试")
+            Notification("模型正在加载中，请稍后再试", position='top')
+            return
+        
         # 启动亮度获取流程
         threading.Thread(target=self.get_brightness_data, daemon=True).start()
     
@@ -397,6 +510,12 @@ class BrightnessManagerApp:
     
     def apply_brightness(self):
         """应用亮度设置"""
+        # 检查模型是否正在加载
+        if self.model_loading:
+            self.log_info("模型正在加载中，请稍后再试")
+            Notification("模型正在加载中，请稍后再试", position='top')
+            return
+        
         brightness = self.brightness_var.get()
         try:
             # 检查屏幕是否息屏，如果是则跳过亮度调整
@@ -427,6 +546,12 @@ class BrightnessManagerApp:
     
     def train_network(self):
         """训练神经网络"""
+        # 检查模型是否正在加载
+        if self.model_loading:
+            self.log_info("模型正在加载中，请稍后再试")
+            Notification("模型正在加载中，请稍后再试", position='top')
+            return
+        
         if not self.nn:
             self.log_error("神经网络未初始化")
             return
