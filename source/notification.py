@@ -180,15 +180,22 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     
     # 测试右下角通知
-    notif = Notification("右下角通知测试", position='bottom')
+    notif = Notification("右下角通知测试1", position='bottom')
     notif.show()
+    time.sleep(1)
+
+    notif = Notification("右下角通知测试2", position='bottom')
+    notif.show()
+    time.sleep(1)
     
     # 测试顶部通知
     notif_top = Notification("顶部通知测试1", position='top')
     notif_top.show()
     time.sleep(1)
-    # 测试顶部通知
+
     notif_top2 = Notification("顶部通知测试2", position='top')
     notif_top2.show()
+    time.sleep(1)
+    notif_top2.close_notification()
     sys.exit(app.exec_())
     
