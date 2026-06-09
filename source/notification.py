@@ -317,7 +317,8 @@ if __name__ == "__main__":
     
     # 关闭所有通知并退出
     time.sleep(5)
-    notif_top2.close_notification()
+    if len(screens) > 1:
+        notif_top_screen2.close_notification()
     
     # 10 秒后退出应用，让所有通知有机会自动关闭
     QTimer.singleShot(10000, app.quit)
