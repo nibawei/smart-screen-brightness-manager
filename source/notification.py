@@ -74,7 +74,27 @@ class Notification(QWidget):
     # 类变量，记录所有通知实例
     notifications = []
     
-    def __init__(self, message, position='top', screen_index=None, parent=None):
+    # 不同级别的颜色配置
+    LEVEL_COLORS = {
+        'info': {
+            'bg': 'rgba(30, 144, 255, 220)',  # 蓝色
+            'text': 'white'
+        },
+        'success': {
+            'bg': 'rgba(34, 197, 94, 220)',   # 绿色
+            'text': 'white'
+        },
+        'warning': {
+            'bg': 'rgba(251, 191, 36, 220)',  # 橙色
+            'text': 'black'
+        },
+        'error': {
+            'bg': 'rgba(239, 68, 68, 220)',   # 红色
+            'text': 'white'
+        }
+    }
+    
+    def __init__(self, message, position='top', screen_index=None, level='info', parent=None):
         """
         初始化通知
         
@@ -82,6 +102,7 @@ class Notification(QWidget):
             message: 通知消息内容
             position: 通知位置，'top' 或 'bottom'
             screen_index: 指定显示器索引（可选），None 表示使用主显示器
+            level: 通知级别，'info'/'success'/'warning'/'error'
             parent: 父窗口
         """
         try:
@@ -110,12 +131,15 @@ class Notification(QWidget):
             screen = QApplication.primaryScreen()
             dpi_scale = screen.logicalDotsPerInch() / 96.0
             
+            # 获取级别颜色
+            colors = self.LEVEL_COLORS.get(level, self.LEVEL_COLORS['info'])
+            
             # 更醒目的样式
             self.label = QLabel(message)
             self.label.setAlignment(Qt.AlignCenter)
             self.label.setStyleSheet(f"""
-                background-color: rgba(30, 144, 255, 220);
-                color: white;
+                background-color: {colors['bg']};
+                color: {colors['text']};
                 padding: {int(6 * dpi_scale)}px {int(16 * dpi_scale)}px;
                 font-size: {int(16 * dpi_scale)}px;
                 border-radius: {int(6 * dpi_scale)}px;
@@ -264,22 +288,21 @@ if __name__ == "__main__":
         primary_mark = " (主显示器)" if screen['is_primary'] else ""
         print(f"  - 索引 {screen['index']}: {screen['name']}{primary_mark}")
     
-    # 测试右下角通知（主显示器）
-    notif = Notification("右下角通知测试 (主屏)", position='bottom')
-    notif.show()
+    # 测试不同级别的通知
+    notif_info = Notification("信息通知 (info)", position='top', level='info')
+    notif_info.show()
     time.sleep(1)
 
-    notif = Notification("右下角通知测试 2 (主屏)", position='bottom')
-    notif.show()
-    time.sleep(1)
-    
-    # 测试顶部通知（主显示器）
-    notif_top = Notification("顶部通知测试 (主屏)", position='top')
-    notif_top.show()
+    notif_success = Notification("操作成功 (success)", position='top', level='success')
+    notif_success.show()
     time.sleep(1)
 
-    notif_top2 = Notification("顶部通知测试 2 (主屏)", position='top')
-    notif_top2.show()
+    notif_warning = Notification("警告提示 (warning)", position='bottom', level='warning')
+    notif_warning.show()
+    time.sleep(1)
+
+    notif_error = Notification("错误发生 (error)", position='bottom', level='error')
+    notif_error.show()
     time.sleep(1)
     
     # 如果有多个显示器，测试在第二个显示器上显示通知
