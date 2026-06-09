@@ -1,5 +1,162 @@
 import numpy as np
 import cv2
+import wmi
+import pythoncom
+
+def get_available_cameras():
+    """获取所有可用的摄像头列表
+    
+    Returns:
+        list: 摄像头信息列表，每个元素为字典，包含 'index' 和 'name'
+    """
+    cameras = []
+    
+    # 方法 1：使用 DirectShow 过滤器枚举摄像头
+    try:
+        # 尝试打开索引 0-9 的摄像头
+        for i in range(10):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                # 尝试获取摄像头名称
+                camera_name = f"摄像头 {i}"
+                try:
+                    # 读取一帧以确认摄像头可用
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        cameras.append({
+                            'index': i,
+                            'name': camera_name
+                        })
+                except:
+                    pass
+                cap.release()
+    except Exception as e:
+        print(f"枚举摄像头时出错：{e}")
+    
+    # 如果 DirectShow 方法失败，使用简单的测试方法
+    if not cameras:
+        try:
+            for i in range(5):
+                cap = cv2.VideoCapture(i)
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        cameras.append({
+                            'index': i,
+                            'name': f"摄像头 {i}"
+                        })
+                    cap.release()
+        except Exception as e:
+            print(f"备用方法枚举摄像头失败：{e}")
+    
+    # 如果还是没有找到摄像头，至少添加默认摄像头 0
+    if not cameras:
+        cameras.append({
+            'index': 0,
+            'name': '默认摄像头'
+        })
+    
+    return cameras
+
+def get_available_monitors():
+    """获取所有可用的显示器列表
+    
+    Returns:
+        list: 显示器信息列表，每个元素为字典，包含 'index' 和 'name'
+    """
+    monitors = []
+    
+    try:
+        # 初始化 COM（WMI 需要）
+        try:
+            pythoncom.CoInitialize()
+        except:
+            pass
+        
+        # 使用 WMI 获取显示器信息
+        wmi_obj = wmi.WMI(namespace='root\\wmi')
+        monitor_configs = wmi_obj.WmiMonitorID()
+        
+        for i, monitor in enumerate(monitor_configs):
+            try:
+                # 获取显示器名称
+                name = "未知显示器"
+                if hasattr(monitor, 'UserFriendlyName') and monitor.UserFriendlyName:
+                    # UserFriendlyName 是一个字节数组，需要转换
+                    try:
+                        name_bytes = monitor.UserFriendlyName
+                        # 过滤掉空字节和无效字符
+                        name_str = ''.join([chr(b) for b in name_bytes if b != 0 and b < 128])
+                        if name_str.strip():
+                            name = name_str.strip()
+                    except:
+                        pass
+                
+                monitors.append({
+                    'index': i,
+                    'name': f"{name} (显示器 {i+1})"
+                })
+            except Exception as e:
+                print(f"获取显示器 {i} 信息失败：{e}")
+                # 添加一个通用的显示器条目
+                monitors.append({
+                    'index': i,
+                    'name': f'显示器 {i+1}'
+                })
+        
+        # 清理 COM
+        try:
+            pythoncom.CoUninitialize()
+        except:
+            pass
+            
+    except Exception as e:
+        print(f"使用 WMI 获取显示器列表失败：{e}")
+        # 如果 WMI 方法失败，使用 Windows API 枚举显示器
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            # 简单的显示器枚举
+            monitor_count = 0
+            def callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
+                nonlocal monitor_count
+                monitor_count += 1
+                return True
+            
+            user32 = ctypes.windll.user32
+            MONITORENUMPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_bool,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.wintypes.RECT),
+                ctypes.c_void_p
+            )
+            
+            user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(callback), 0)
+            
+            # 添加检测到的显示器
+            for i in range(monitor_count):
+                monitors.append({
+                    'index': i,
+                    'name': f'显示器 {i+1}'
+                })
+        except Exception as e2:
+            print(f"备用方法获取显示器列表失败：{e2}")
+            # 如果所有方法都失败，至少添加一个默认显示器
+            monitors.append({
+                'index': 0,
+                'name': '默认显示器'
+            })
+    
+    # 如果没有找到任何显示器，添加一个默认显示器
+    if not monitors:
+        monitors.append({
+            'index': 0,
+            'name': '默认显示器'
+        })
+    
+    return monitors
 
 def process_frame(frame):
     """处理每一帧图像的亮度和对比度计算
@@ -243,11 +400,13 @@ def capture_frames_from_camera(camera_index=0, num_frames=20):
     
     return frames
 
-def adjust_brightness(target_brightness):
+def adjust_brightness(target_brightness, monitor_indices=None):
     """调整 Windows 系统屏幕亮度
     
     Args:
         target_brightness: 目标亮度值（范围0-100）
+        
+        monitor_indices: 要调整亮度的显示器索引列表，默认为None（调整所有显示器）
         
     Returns:
         bool: 操作是否成功
@@ -279,19 +438,24 @@ def adjust_brightness(target_brightness):
                     if monitors:
                         print(f"在命名空间 {namespace} 中找到 {len(monitors)} 个显示器")
                         for i, monitor in enumerate(monitors):
+                            # 如果指定了显示器索引列表，只调整指定的显示器
+                            if monitor_indices is not None and i not in monitor_indices:
+                                print(f"跳过显示器 {i}（不在选择列表中）")
+                                continue
+                            
                             try:
-                                print(f"正在设置显示器 {i+1} 的亮度...")
+                                print(f"正在设置显示器 {i} 的亮度...")
                                 # 尝试不同的超时值
                                 for timeout in [0, 1000, 5000]:
                                     try:
                                         monitor.WmiSetBrightness(brightness, timeout)
-                                        print(f"显示器 {i+1} 亮度设置成功")
+                                        print(f"显示器 {i} 亮度设置成功")
                                         success = True
                                         break
                                     except Exception as e:
                                         print(f"使用超时 {timeout} 设置亮度失败: {str(e)}")
                             except Exception as e:
-                                print(f"设置显示器 {i+1} 亮度时出错: {str(e)}")
+                                print(f"设置显示器 {i} 亮度时出错: {str(e)}")
                         if success:
                             break
                     else:

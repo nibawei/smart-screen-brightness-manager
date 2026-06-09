@@ -199,3 +199,4 @@ if __name__ == "__main__":
     notif_top2.close_notification()
     sys.exit(app.exec_())
     
+    

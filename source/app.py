@@ -87,7 +87,7 @@ def is_monitor_on():
         except:
             pass
 
-from liangdu import BrightnessNeuralNetwork, capture_frames_from_camera, calculate_average_brightness, adjust_brightness, generate_synthetic_data
+from liangdu import BrightnessNeuralNetwork, capture_frames_from_camera, calculate_average_brightness, adjust_brightness, generate_synthetic_data, get_available_cameras, get_available_monitors
 from config import config_manager
 from utils import SystemUtils, ToastNotifier
 from notification import Notification
@@ -129,6 +129,12 @@ class BrightnessManagerApp:
         self.startup_enabled = SystemUtils.get_startup()
         # 更新配置文件
         config_manager.set('startup', self.startup_enabled)
+        
+        # 摄像头和显示器选择相关变量
+        self.available_cameras = []  # 可用摄像头列表
+        self.available_monitors = []  # 可用显示器列表
+        self.selected_camera_index = 0  # 选中的摄像头索引
+        self.selected_monitor_indices = [0]  # 选中的显示器索引列表
         
         # 初始化系统托盘
         self.tray = None
@@ -275,6 +281,61 @@ class BrightnessManagerApp:
         
         # 绑定选择事件
         interval_combo.bind("<<ComboboxSelected>>", self.on_interval_change)
+        
+        # 创建摄像头选择框架
+        camera_frame = ttk.Frame(settings_frame)
+        camera_frame.pack(fill=tk.X, pady=5)
+        
+        # 创建摄像头选择标签
+        camera_label = ttk.Label(camera_frame, text="摄像头选择:")
+        camera_label.pack(side=tk.LEFT, padx=5)
+        
+        # 创建摄像头下拉框（单选）
+        self.camera_var = tk.StringVar()
+        self.camera_combo = ttk.Combobox(
+            camera_frame,
+            textvariable=self.camera_var,
+            state="readonly",
+            width=20
+        )
+        self.camera_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 创建刷新摄像头列表按钮
+        refresh_camera_button = ttk.Button(
+            camera_frame,
+            text="刷新",
+            command=self.on_refresh_cameras
+        )
+        refresh_camera_button.pack(side=tk.LEFT, padx=5)
+        
+        # 初始化摄像头列表
+        self.refresh_camera_list()
+        
+        # 创建设备选择框架
+        monitor_frame = ttk.Frame(settings_frame)
+        monitor_frame.pack(fill=tk.X, pady=5)
+        
+        # 创建显示器选择标签
+        monitor_label = ttk.Label(monitor_frame, text="显示器选择:")
+        monitor_label.pack(side=tk.LEFT, padx=5)
+        
+        # 创建显示器复选框框架
+        self.monitor_checkboxes_frame = ttk.Frame(monitor_frame)
+        self.monitor_checkboxes_frame.pack(side=tk.LEFT, padx=5)
+        
+        # 存储显示器复选框变量
+        self.monitor_vars = {}
+        
+        # 创建刷新显示器列表按钮
+        refresh_monitor_button = ttk.Button(
+            monitor_frame,
+            text="刷新",
+            command=self.on_refresh_monitors
+        )
+        refresh_monitor_button.pack(side=tk.LEFT, padx=5)
+        
+        # 初始化显示器列表
+        self.refresh_monitor_list()
     
     def init_neural_network_async(self):
         """在后台线程中异步初始化神经网络"""
@@ -526,8 +587,11 @@ class BrightnessManagerApp:
             
             # 显示调整开始通知
             # Notification(f"正在调整亮度至 {brightness}%", position='top')
-
-            success = adjust_brightness(brightness)
+            
+            # 获取选中的显示器索引列表
+            monitor_indices = self.get_selected_monitor_indices()
+            
+            success = adjust_brightness(brightness, monitor_indices)
             if success:
                 self.log_info(f"亮度已调整为: {brightness}%")
                 self.current_brightness = brightness
@@ -606,8 +670,11 @@ class BrightnessManagerApp:
         """获取亮度数据"""
         self.log_info("正在获取亮度数据...")
         try:
+            # 获取选中的摄像头索引
+            camera_index = self.get_selected_camera_index()
+            
             # 捕获图像帧，减少帧数以提升性能
-            frames = capture_frames_from_camera(num_frames=10)
+            frames = capture_frames_from_camera(camera_index=camera_index, num_frames=10)
             
             if frames:
                 # 计算当前亮度和其他特征，返回(current_brightness, features)元组
@@ -694,8 +761,11 @@ class BrightnessManagerApp:
             # 设置超时机制，避免长时间阻塞
             def run_with_timeout():
                 try:
+                    # 获取选中的摄像头索引
+                    camera_index = self.get_selected_camera_index()
+                    
                     # 获取亮度数据，减少帧数以提升性能
-                    frames = capture_frames_from_camera(num_frames=10)
+                    frames = capture_frames_from_camera(camera_index=camera_index, num_frames=10)
                     
                     if frames and self.nn:
                         # 计算当前亮度和其他特征，返回(current_brightness, features)元组
@@ -712,7 +782,9 @@ class BrightnessManagerApp:
                         predicted_brightness = int(predicted_brightness)
                         
                         # 调整亮度
-                        success = adjust_brightness(predicted_brightness)
+                        # 获取选中的显示器索引列表
+                        monitor_indices = self.get_selected_monitor_indices()
+                        success = adjust_brightness(predicted_brightness, monitor_indices)
                         if success:
                             # 使用Tkinter的after方法在主线程显示通知
                             self.root.after(0, lambda: Notification(f"亮度已自动调整为 {predicted_brightness}%", position='top'))
@@ -770,11 +842,89 @@ class BrightnessManagerApp:
             if text == selected_text:
                 self.check_interval = seconds
                 config_manager.set('check_interval', self.check_interval)
-                self.log_info(f"循环检查间隔已设置为: {text}")
+                self.log_info(f"循环检查间隔已设置为：{text}")
                 # 如果自动亮度调整已启用，重启定时任务
                 if self.auto_brightness_enabled:
                     self.start_auto_adjust_timer()
                 break
+    
+    def refresh_camera_list(self):
+        """刷新摄像头列表"""
+        try:
+            # 获取可用的摄像头列表
+            self.available_cameras = get_available_cameras()
+            
+            # 更新下拉框选项
+            camera_names = [cam['name'] for cam in self.available_cameras]
+            self.camera_combo['values'] = camera_names
+            
+            # 设置默认选中项
+            if camera_names:
+                self.camera_var.set(camera_names[0])
+            
+            self.log_info(f"已刷新摄像头列表，找到 {len(self.available_cameras)} 个摄像头")
+        except Exception as e:
+            self.log_error(f"刷新摄像头列表失败：{e}")
+    
+    def on_refresh_cameras(self):
+        """手动刷新摄像头列表"""
+        self.log_info("正在刷新摄像头列表...")
+        self.refresh_camera_list()
+        Notification("摄像头列表已刷新", position='top')
+    
+    def refresh_monitor_list(self):
+        """刷新显示器列表"""
+        try:
+            # 获取可用的显示器列表
+            self.available_monitors = get_available_monitors()
+            
+            # 清除现有的复选框
+            for widget in self.monitor_checkboxes_frame.winfo_children():
+                widget.destroy()
+            self.monitor_vars.clear()
+            
+            # 创建新的复选框
+            for monitor in self.available_monitors:
+                var = tk.BooleanVar(value=True)  # 默认选中所有显示器
+                self.monitor_vars[monitor['index']] = var
+                
+                cb = ttk.Checkbutton(
+                    self.monitor_checkboxes_frame,
+                    text=monitor['name'],
+                    variable=var
+                )
+                cb.pack(anchor=tk.W)
+            
+            self.log_info(f"已刷新显示器列表，找到 {len(self.available_monitors)} 个显示器")
+        except Exception as e:
+            self.log_error(f"刷新显示器列表失败：{e}")
+    
+    def on_refresh_monitors(self):
+        """手动刷新显示器列表"""
+        self.log_info("正在刷新显示器列表...")
+        self.refresh_monitor_list()
+        Notification("显示器列表已刷新", position='top')
+    
+    def get_selected_camera_index(self):
+        """获取选中的摄像头索引"""
+        selected_name = self.camera_var.get()
+        for cam in self.available_cameras:
+            if cam['name'] == selected_name:
+                return cam['index']
+        return 0  # 默认返回 0
+    
+    def get_selected_monitor_indices(self):
+        """获取选中的显示器索引列表"""
+        selected_indices = []
+        for monitor in self.available_monitors:
+            if self.monitor_vars.get(monitor['index'], tk.BooleanVar(value=False)).get():
+                selected_indices.append(monitor['index'])
+        
+        # 如果没有选中任何显示器，默认使用第一个
+        if not selected_indices and self.available_monitors:
+            selected_indices.append(0)
+        
+        return selected_indices
     
     def log_info(self, message):
         """记录信息"""
