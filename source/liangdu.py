@@ -2,13 +2,39 @@ import numpy as np
 import cv2
 import wmi
 import pythoncom
+import time
 
-def get_available_cameras():
+# 摄像头列表缓存
+_camera_cache = {
+    'cameras': [],
+    'timestamp': 0,
+    'cache_duration': 60  # 缓存 60 秒，减少频繁扫描
+}
+
+# 显示器列表缓存
+_monitor_cache = {
+    'monitors': [],
+    'timestamp': 0,
+    'cache_duration': 60  # 缓存 60 秒，减少频繁扫描
+}
+
+def get_available_cameras(force_refresh=False):
     """获取所有可用的摄像头列表
     
+    Args:
+        force_refresh: 是否强制刷新，忽略缓存
+        
     Returns:
         list: 摄像头信息列表，每个元素为字典，包含 'index' 和 'name'
     """
+    global _camera_cache
+    
+    # 检查缓存是否有效（除非强制刷新）
+    current_time = time.time()
+    if not force_refresh and _camera_cache['cameras']:
+        if current_time - _camera_cache['timestamp'] < _camera_cache['cache_duration']:
+            return _camera_cache['cameras']
+    
     cameras = []
     
     # 方法 1：使用 DirectShow 过滤器枚举摄像头
@@ -37,7 +63,7 @@ def get_available_cameras():
     if not cameras:
         try:
             for i in range(5):
-                cap = cv2.VideoCapture(i)
+                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
                 if cap.isOpened():
                     ret, frame = cap.read()
                     if ret and frame is not None:
@@ -56,14 +82,29 @@ def get_available_cameras():
             'name': '默认摄像头'
         })
     
+    # 更新缓存
+    _camera_cache['cameras'] = cameras
+    _camera_cache['timestamp'] = current_time
+    
     return cameras
 
-def get_available_monitors():
+def get_available_monitors(force_refresh=False):
     """获取所有可用的显示器列表
     
+    Args:
+        force_refresh: 是否强制刷新，忽略缓存
+        
     Returns:
         list: 显示器信息列表，每个元素为字典，包含 'index' 和 'name'
     """
+    global _monitor_cache
+    
+    # 检查缓存是否有效（除非强制刷新）
+    current_time = time.time()
+    if not force_refresh and _monitor_cache['monitors']:
+        if current_time - _monitor_cache['timestamp'] < _monitor_cache['cache_duration']:
+            return _monitor_cache['monitors']
+    
     monitors = []
     
     try:
@@ -155,6 +196,10 @@ def get_available_monitors():
             'index': 0,
             'name': '默认显示器'
         })
+    
+    # 更新缓存
+    _monitor_cache['monitors'] = monitors
+    _monitor_cache['timestamp'] = current_time
     
     return monitors
 
@@ -366,8 +411,8 @@ def capture_frames_from_camera(camera_index=0, num_frames=20):
         list: 捕获的图像帧列表
         None: 如果无法打开摄像头或未捕获到任何帧
     """
-    # 打开摄像头
-    cap = cv2.VideoCapture(camera_index)
+    # 打开摄像头（使用 DirectShow 后端以减少警告）
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     
     # 检查摄像头是否成功打开
     if not cap.isOpened():

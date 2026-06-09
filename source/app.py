@@ -886,6 +886,10 @@ class BrightnessManagerApp:
         Returns:
             bool: 设备是否可用
         """
+        # 在检查前，先检测是否有热插拔变化（只在需要时检测）
+        self.check_camera_hotplug_if_needed()
+        self.check_monitor_hotplug_if_needed()
+        
         # 检查摄像头
         if not self.available_cameras:
             self.log_warning("没有可用的摄像头，无法获取环境亮度")
@@ -941,15 +945,16 @@ class BrightnessManagerApp:
                     self.start_auto_adjust_timer()
                 break
     
-    def refresh_camera_list(self, restore_selection=True):
+    def refresh_camera_list(self, restore_selection=True, force_refresh=False):
         """刷新摄像头列表
         
         Args:
             restore_selection: 是否恢复上次选择的摄像头
+            force_refresh: 是否强制刷新摄像头列表
         """
         try:
             # 获取可用的摄像头列表
-            self.available_cameras = get_available_cameras()
+            self.available_cameras = get_available_cameras(force_refresh=force_refresh)
             
             # 更新下拉框选项
             camera_names = [cam['name'] for cam in self.available_cameras]
@@ -978,18 +983,19 @@ class BrightnessManagerApp:
     def on_refresh_cameras(self):
         """手动刷新摄像头列表"""
         self.log_info("正在刷新摄像头列表...")
-        self.refresh_camera_list()
+        self.refresh_camera_list(force_refresh=True)
         Notification("摄像头列表已刷新", position='top', level='success')
     
-    def refresh_monitor_list(self, restore_selection=True):
+    def refresh_monitor_list(self, restore_selection=True, force_refresh=False):
         """刷新显示器列表
         
         Args:
             restore_selection: 是否恢复上次选择的显示器
+            force_refresh: 是否强制刷新显示器列表
         """
         try:
             # 获取可用的显示器列表
-            self.available_monitors = get_available_monitors()
+            self.available_monitors = get_available_monitors(force_refresh=force_refresh)
             
             # 清除现有的复选框
             for widget in self.monitor_checkboxes_frame.winfo_children():
@@ -1045,7 +1051,7 @@ class BrightnessManagerApp:
     def on_refresh_monitors(self):
         """手动刷新显示器列表"""
         self.log_info("正在刷新显示器列表...")
-        self.refresh_monitor_list()
+        self.refresh_monitor_list(force_refresh=True)
         Notification("显示器列表已刷新", position='top', level='success')
     
     def on_camera_change(self, event):
@@ -1072,62 +1078,8 @@ class BrightnessManagerApp:
         
         device_changed = False
         
-        # 检查摄像头热插拔
-        try:
-            current_cameras = get_available_cameras()
-            current_camera_names = [c['name'] for c in current_cameras]
-            
-            if set(current_camera_names) != set(self.last_camera_names):
-                self.log_info("检测到摄像头配置变化，正在刷新列表...")
-                self.refresh_camera_list(restore_selection=True)
-                
-                # 检查是否有新摄像头接入
-                new_cameras = [name for name in current_camera_names if name not in self.last_camera_names]
-                if new_cameras:
-                    Notification(f"检测到新摄像头: {', '.join(new_cameras)}", position='top', level='info')
-                
-                # 检查是否有摄像头断开
-                removed_cameras = [name for name in self.last_camera_names if name not in current_camera_names]
-                if removed_cameras:
-                    Notification(f"摄像头已断开: {', '.join(removed_cameras)}", position='top', level='warning')
-                    # 如果当前选中的摄像头已断开，自动切换到可用摄像头
-                    self._handle_selected_camera_unavailable(removed_cameras)
-                
-                self.last_camera_names = current_camera_names
-                device_changed = True
-        except Exception as e:
-            self.log_error(f"检查摄像头热插拔失败: {e}")
-        
-        # 检查显示器热插拔
-        try:
-            current_monitors = get_available_monitors()
-            current_names = [m['name'] for m in current_monitors]
-            
-            if set(current_names) != set(self.last_monitor_names):
-                self.log_info("检测到显示器配置变化，正在刷新列表...")
-                self.refresh_monitor_list(restore_selection=True)
-                
-                # 检查是否有新显示器接入
-                new_monitors = [name for name in current_names if name not in self.last_monitor_names]
-                if new_monitors:
-                    Notification(f"检测到新显示器: {', '.join(new_monitors)}", position='top', level='info')
-                
-                # 检查是否有显示器断开
-                removed_monitors = [name for name in self.last_monitor_names if name not in current_names]
-                if removed_monitors:
-                    Notification(f"显示器已断开: {', '.join(removed_monitors)}", position='top', level='warning')
-                    # 如果当前选中的显示器已断开，自动切换到可用显示器
-                    self._handle_selected_monitors_unavailable(removed_monitors)
-                
-                self.last_monitor_names = current_names
-                device_changed = True
-        except Exception as e:
-            self.log_error(f"检查显示器热插拔失败: {e}")
-        
-        if device_changed:
-            self.last_hotplug_refresh_time = current_time
-        
-        return device_changed
+        # 已废弃：改为按需检测
+        # 只在需要时（调整亮度或手动刷新）才检测
     
     def _handle_selected_camera_unavailable(self, removed_cameras):
         """处理选中的摄像头不可用的情况"""
@@ -1172,17 +1124,73 @@ class BrightnessManagerApp:
     
     def start_hotplug_detection(self):
         """启动热插拔检测定时器"""
-        def check():
-            self.check_device_hotplug()
-            # 每 5 秒检测一次
-            self.root.after(5000, check)
-        
-        # 初始化设备列表
+        # 显示器热插拔检测已移除，改为按需检测
+        # 只在需要调整亮度或手动刷新时才检测显示器变化
         self.last_camera_names = [c['name'] for c in self.available_cameras]
         self.last_monitor_names = [m['name'] for m in self.available_monitors]
         
-        self.root.after(5000, check)
-        self.log_info("已启动设备热插拔检测（摄像头和显示器）")
+        self.log_info("热插拔检测已禁用（改为按需检测）")
+    
+    def check_camera_hotplug_if_needed(self):
+        """检查摄像头是否需要热插拔检测（只在需要时检测）
+        
+        当选中的摄像头不可用时，才进行热插拔检测
+        """
+        selected_camera = self.camera_var.get()
+        
+        # 如果选中的摄像头不在当前列表中，说明可能需要刷新
+        if selected_camera and self.available_cameras:
+            if selected_camera not in [c['name'] for c in self.available_cameras]:
+                # 选中的摄像头不可用，刷新列表
+                self.log_info("检测到摄像头可能已断开，正在刷新列表...")
+                self.refresh_camera_list(restore_selection=False, force_refresh=True)
+                
+                # 如果刷新后还是没有找到选中的摄像头
+                if selected_camera not in [c['name'] for c in self.available_cameras]:
+                    self.log_warning(f"摄像头 '{selected_camera}' 已断开")
+                    Notification(f"摄像头已断开：{selected_camera}", position='top', level='warning')
+                    # 自动切换到第一个可用摄像头
+                    if self.available_cameras:
+                        new_camera = self.available_cameras[0]['name']
+                        self.camera_var.set(new_camera)
+                        config_manager.set('selected_camera_name', new_camera)
+                        Notification(f"已自动切换到：{new_camera}", position='top', level='info')
+                    else:
+                        self.camera_var.set('')
+                        Notification("所有摄像头已断开，无法获取环境亮度", position='top', level='error')
+        elif not self.available_cameras:
+            # 没有任何摄像头，尝试刷新
+            self.refresh_camera_list(restore_selection=False, force_refresh=True)
+    
+    def check_monitor_hotplug_if_needed(self):
+        """检查显示器是否需要热插拔检测（只在需要时检测）
+        
+        当选中的显示器不可用时，才进行热插拔检测
+        """
+        # 获取当前选中的显示器名称
+        selected_names = []
+        for monitor in self.available_monitors:
+            if self.monitor_vars.get(monitor['index'], tk.BooleanVar(value=False)).get():
+                selected_names.append(monitor['name'])
+        
+        # 检查是否有选中的显示器不在当前列表中
+        if selected_names and self.available_monitors:
+            current_monitor_names = [m['name'] for m in self.available_monitors]
+            unavailable_monitors = [name for name in selected_names if name not in current_monitor_names]
+            
+            if unavailable_monitors:
+                # 有显示器不可用，刷新列表
+                self.log_info("检测到显示器可能已断开，正在刷新列表...")
+                self.refresh_monitor_list(restore_selection=True, force_refresh=True)
+                
+                # 通知用户
+                Notification(f"显示器已断开：{', '.join(unavailable_monitors)}", position='top', level='warning')
+                
+                # 自动切换到可用的显示器
+                self._handle_selected_monitors_unavailable(unavailable_monitors)
+        elif not self.available_monitors:
+            # 没有任何显示器，尝试刷新
+            self.refresh_monitor_list(restore_selection=False)
     
     def get_selected_camera_index(self):
         """获取选中的摄像头索引
