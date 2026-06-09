@@ -27,7 +27,7 @@ def get_app():
     return _app
 
 def ensure_qapplication_thread():
-    """确保QApplication在正确的线程中运行"""
+    """确保 QApplication 在正确的线程中运行"""
     app = get_app()
     # 检查是否在主线程中
     if threading.current_thread() is threading.main_thread():
@@ -37,17 +37,73 @@ def ensure_qapplication_thread():
         # 在非主线程中，使用定时器异步处理
         QTimer.singleShot(0, app.processEvents)
 
+def get_available_screens():
+    """获取所有可用的显示器列表
+    
+    Returns:
+        list: 显示器信息列表，每个元素为字典，包含 'index' 和 'name'
+    """
+    screens = []
+    try:
+        q_app = get_app()
+        screen_list = q_app.screens()
+        for i, screen in enumerate(screen_list):
+            # 获取显示器名称
+            name = screen.name() if hasattr(screen, 'name') else f"显示器 {i+1}"
+            # 获取显示器分辨率
+            geom = screen.geometry()
+            resolution = f"{geom.width()}x{geom.height()}"
+            
+            screens.append({
+                'index': i,
+                'name': f"{name} ({resolution})",
+                'is_primary': screen == q_app.primaryScreen()
+            })
+    except Exception as e:
+        print(f"获取显示器列表失败：{e}")
+        # 如果失败，至少添加一个默认显示器
+        screens.append({
+            'index': 0,
+            'name': '默认显示器',
+            'is_primary': True
+        })
+    
+    return screens
+
 class Notification(QWidget):
     # 类变量，记录所有通知实例
     notifications = []
     
-    def __init__(self, message, position='top', parent=None):
+    def __init__(self, message, position='top', screen_index=None, parent=None):
+        """
+        初始化通知
+        
+        Args:
+            message: 通知消息内容
+            position: 通知位置，'top' 或 'bottom'
+            screen_index: 指定显示器索引（可选），None 表示使用主显示器
+            parent: 父窗口
+        """
         try:
-            # 确保QApplication实例存在
+            # 确保 QApplication 实例存在
             self.q_app = get_app()
             super().__init__(parent)
             self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
             self.setAttribute(Qt.WA_TranslucentBackground)
+            
+            # 获取指定的屏幕
+            if screen_index is not None:
+                screens = QApplication.screens()
+                if 0 <= screen_index < len(screens):
+                    screen = screens[screen_index]
+                else:
+                    # 如果索引无效，使用主屏幕
+                    screen = QApplication.primaryScreen()
+            else:
+                screen = QApplication.primaryScreen()
+            
+            self.screen = screen  # 保存屏幕引用
+            self.screen_index = screen_index  # 保存屏幕索引
             
             # 进一步简化样式
             # 获取屏幕DPI缩放比例
@@ -85,13 +141,14 @@ class Notification(QWidget):
             
             self.setFixedSize(self.size())
             
-            screen = QApplication.primaryScreen().geometry()
+            # 使用指定屏幕的几何信息
+            screen_geom = screen.geometry()
             if position == 'top':
-                self.move(screen.center().x() - self.width()//2, 20)
+                self.move(screen_geom.center().x() - self.width()//2, 20)
             else:
                 # 修正右下角位置计算
-                self.move(screen.width() - self.width() - 20, 
-                         screen.height() - self.height() - 120)  # 从原来的-20改为-60
+                self.move(screen_geom.width() - self.width() - 20, 
+                         screen_geom.height() - self.height() - 120)  # 从原来的 -20 改为 -60
             
             # 确保窗口已经显示并更新几何信息
             self.show()
@@ -154,21 +211,42 @@ class Notification(QWidget):
         self.update_positions()
     
     def update_positions(self):
-        screen = QApplication.primaryScreen().geometry()
-        top_notifications = [n for n in Notification.notifications 
-                            if n.position == 'top']
-        bottom_notifications = [n for n in Notification.notifications 
-                              if n.position == 'bottom']
+        # 按屏幕分组更新通知位置
+        # 获取所有屏幕
+        screens = QApplication.screens()
         
-        # 更新顶部通知位置
-        for i, notif in enumerate(top_notifications):
-            notif.move(screen.center().x() - notif.width()//2, 
-                      20 + i * (notif.height() + 10))
+        # 按屏幕索引和位置分组通知
+        screen_notifications = {}
+        for notif in Notification.notifications:
+            screen_idx = getattr(notif, 'screen_index', None)
+            if screen_idx is None:
+                screen_idx = 0  # 主屏幕
+            
+            if screen_idx not in screen_notifications:
+                screen_notifications[screen_idx] = {'top': [], 'bottom': []}
+            
+            pos = getattr(notif, 'position', 'top')
+            screen_notifications[screen_idx][pos].append(notif)
         
-        # 更新底部通知位置
-        for i, notif in enumerate(bottom_notifications):
-            notif.move(screen.width() - notif.width() - 20,
-                      screen.height() - notif.height() - 120 - i * (notif.height() + 10))
+        # 为每个屏幕更新通知位置
+        for screen_idx, positions in screen_notifications.items():
+            # 获取屏幕
+            if 0 <= screen_idx < len(screens):
+                screen = screens[screen_idx]
+            else:
+                screen = QApplication.primaryScreen()
+            
+            screen_geom = screen.geometry()
+            
+            # 更新顶部通知位置
+            for i, notif in enumerate(positions['top']):
+                notif.move(screen_geom.center().x() - notif.width()//2, 
+                          20 + i * (notif.height() + 10))
+            
+            # 更新底部通知位置
+            for i, notif in enumerate(positions['bottom']):
+                notif.move(screen_geom.width() - notif.width() - 20,
+                          screen_geom.height() - notif.height() - 120 - i * (notif.height() + 10))
     
     def mousePressEvent(self, event: QMouseEvent):
         # 点击任意位置都可以关闭通知
@@ -179,24 +257,47 @@ if __name__ == "__main__":
     import sys
     app = QApplication(sys.argv)
     
-    # 测试右下角通知
-    notif = Notification("右下角通知测试1", position='bottom')
+    # 获取所有可用显示器
+    screens = get_available_screens()
+    print(f"检测到 {len(screens)} 个显示器:")
+    for screen in screens:
+        primary_mark = " (主显示器)" if screen['is_primary'] else ""
+        print(f"  - 索引 {screen['index']}: {screen['name']}{primary_mark}")
+    
+    # 测试右下角通知（主显示器）
+    notif = Notification("右下角通知测试 (主屏)", position='bottom')
     notif.show()
     time.sleep(1)
 
-    notif = Notification("右下角通知测试2", position='bottom')
+    notif = Notification("右下角通知测试 2 (主屏)", position='bottom')
     notif.show()
     time.sleep(1)
     
-    # 测试顶部通知
-    notif_top = Notification("顶部通知测试1", position='top')
+    # 测试顶部通知（主显示器）
+    notif_top = Notification("顶部通知测试 (主屏)", position='top')
     notif_top.show()
     time.sleep(1)
 
-    notif_top2 = Notification("顶部通知测试2", position='top')
+    notif_top2 = Notification("顶部通知测试 2 (主屏)", position='top')
     notif_top2.show()
     time.sleep(1)
+    
+    # 如果有多个显示器，测试在第二个显示器上显示通知
+    if len(screens) > 1:
+        notif_screen2 = Notification(f"第二显示器通知测试", position='bottom', screen_index=1)
+        notif_screen2.show()
+        time.sleep(1)
+        
+        notif_top_screen2 = Notification(f"第二显示器顶部通知", position='top', screen_index=1)
+        notif_top_screen2.show()
+        time.sleep(1)
+    
+    # 关闭所有通知并退出
+    time.sleep(5)
     notif_top2.close_notification()
+    
+    # 10 秒后退出应用，让所有通知有机会自动关闭
+    QTimer.singleShot(10000, app.quit)
     sys.exit(app.exec_())
     
     
