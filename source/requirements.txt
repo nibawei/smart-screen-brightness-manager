@@ -1,9 +1,7 @@
 numpy==2.4.2
-opencv-python==4.13.0.92
+opencv-python-headless==4.13.0.92
 pillow==12.1.1
 PyQt5==5.15.11
 pystray==0.19.5
 pywin32==311
 WMI==1.5.1
-six==1.17.0
-pyinstaller==6.0.0

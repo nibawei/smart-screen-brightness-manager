@@ -56,9 +56,10 @@ class ConfigManager:
             'startup': False,  # 是否开机自启动
             'model_path': 'brightness_model.npz',  # 神经网络模型路径（相对于可执行文件）
             'log_level': 'info',  # 日志级别
-            'check_interval': 300,  # 循环检查间隔（秒），默认5分钟，范围60秒到86400秒
+            'check_interval': 300,  # 循环检查间隔（秒），默认 5 分钟，范围 60 秒到 86400 秒
             'selected_camera_name': None,  # 上次选择的摄像头名称
-            'selected_monitor_names': None  # 上次选择的显示器名称列表
+            'selected_monitor_names': None,  # 上次选择的显示器名称列表
+            'notification_position': 'bottom'  # 通知显示位置：'top'（顶部）或 'bottom'（右下）
         }
         self.config = self.load_config()
     

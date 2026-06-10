@@ -17,6 +17,7 @@ import win32con
 import win32process
 import wmi
 import pythoncom
+from PyQt5.QtCore import Qt
 
 # 获取可执行文件路径
 def get_executable_path():
@@ -354,6 +355,45 @@ class BrightnessManagerApp:
         
         # 初始化显示器列表
         self.refresh_monitor_list()
+        
+        # 创建通知位置选择框架
+        notification_position_frame = ttk.Frame(settings_frame)
+        notification_position_frame.pack(fill=tk.X, pady=5)
+        
+        # 创建通知位置选择标签
+        notification_position_label = ttk.Label(notification_position_frame, text="通知显示位置:")
+        notification_position_label.pack(side=tk.LEFT, padx=5)
+        
+        # 获取保存的通知位置配置
+        self.notification_position = config_manager.get('notification_position', 'bottom')
+        
+        # 创建通知位置下拉框
+        self.notification_position_var = tk.StringVar()
+        notification_position_combo = ttk.Combobox(
+            notification_position_frame,
+            textvariable=self.notification_position_var,
+            values=["右下", "顶部"],
+            state="readonly",
+            width=10
+        )
+        notification_position_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 设置当前值
+        self.notification_position_var.set("右下" if self.notification_position == 'bottom' else "顶部")
+        
+        # 绑定选择事件
+        notification_position_combo.bind("<<ComboboxSelected>>", self.on_notification_position_change)
+        # 测试通知位置
+        show_notification("通知将在此处展示", position=self.notification_position, level='info')
+    def on_notification_position_change(self, event):
+        """处理通知位置选择变化"""
+        selected_text = self.notification_position_var.get()
+        # 转换为配置值
+        self.notification_position = 'bottom' if selected_text == "右下" else 'top'
+        # 保存到配置
+        config_manager.set('notification_position', self.notification_position)
+        config_manager.save_config()
+        self.log_info(f"通知位置已更改为：{selected_text}")
     
     def init_neural_network_async(self):
         """在后台线程中异步初始化神经网络"""
@@ -573,7 +613,7 @@ class BrightnessManagerApp:
         # 检查模型是否正在加载
         if self.model_loading:
             self.log_info("模型正在加载中，请稍后再试")
-            show_window_notification("模型正在加载中，请稍后再试", level='info')
+            show_window_notification("模型正在加载中，请稍后再试", position=self.notification_position, level='info')
             return
         
         # 启动亮度获取流程
@@ -597,13 +637,13 @@ class BrightnessManagerApp:
         """应用亮度设置"""
         # 检查按钮点击频率
         if not self.can_click_button("apply_brightness"):
-            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            show_window_notification("操作过于频繁，请稍后再试", position=self.notification_position, level='warning')
             return
         
         # 检查模型是否正在加载
         if self.model_loading:
             self.log_info("模型正在加载中，请稍后再试")
-            show_window_notification("模型正在加载中，请稍后再试", level='info')
+            show_window_notification("模型正在加载中，请稍后再试", position=self.notification_position, level='info')
             return
         
         brightness = self.brightness_var.get()
@@ -611,13 +651,13 @@ class BrightnessManagerApp:
             # 检查屏幕是否息屏，如果是则跳过亮度调整
             if not is_monitor_on():
                 self.log_info("屏幕处于息屏状态，跳过手动亮度调整")
-                show_window_notification("屏幕处于息屏状态，亮度调整已跳过", level='warning')
+                show_window_notification("屏幕处于息屏状态，亮度调整已跳过", position=self.notification_position, level='warning')
                 return  # 跳出函数，不执行亮度调整
             
             # 检查显示器可用性
             if not self.available_monitors:
                 self.log_warning("没有可用的显示器，无法调整亮度")
-                show_window_notification("没有可用的显示器", level='warning')
+                show_window_notification("没有可用的显示器", position=self.notification_position, level='warning')
                 return
             
             # 获取选中的显示器索引列表
@@ -625,55 +665,55 @@ class BrightnessManagerApp:
             
             if not monitor_indices:
                 self.log_warning("没有选中任何显示器，无法调整亮度")
-                show_window_notification("请先选择要调整的显示器", level='warning')
+                show_window_notification("请先选择要调整的显示器", position=self.notification_position, level='warning')
                 return
             
             success = adjust_brightness(brightness, monitor_indices)
             if success:
-                self.log_info(f"亮度已调整为: {brightness}%")
+                self.log_info(f"亮度已调整为：{brightness}%")
                 self.current_brightness = brightness
                 # 在所有需要调整的屏幕上显示通知
                 for idx in monitor_indices:
-                    show_notification(f"亮度已调整为 {brightness}%", screen_mode='custom', screen_index=idx, level='success')
+                    show_notification(f"亮度已调整为 {brightness}%", position=self.notification_position, screen_mode='custom', screen_index=idx, level='success')
             else:
                 error_msg = "调整亮度失败，显示器可能不支持亮度调节"
                 self.log_error(error_msg)
                 # 在所有需要调整的屏幕上显示错误通知
                 for idx in monitor_indices:
-                    show_notification(error_msg, screen_mode='custom', screen_index=idx, level='error')
+                    show_notification(error_msg, position=self.notification_position, screen_mode='custom', screen_index=idx, level='error')
         except Exception as e:
-            error_msg = f"调整亮度时出错: {e}"
+            error_msg = f"调整亮度时出错：{e}"
             self.log_error(error_msg)
             # 显示错误通知
-            show_window_notification(error_msg, level='error')
+            show_window_notification(error_msg, position=self.notification_position, level='error')
     
     def train_network(self):
         """训练神经网络"""
         # 检查按钮点击频率
         if not self.can_click_button("train_network"):
-            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            show_window_notification("操作过于频繁，请稍后再试", position=self.notification_position, level='warning')
             return
         
         # 检查模型是否正在加载
         if self.model_loading:
             self.log_info("模型正在加载中，请稍后再试")
-            show_window_notification("模型正在加载中，请稍后再试", level='info')
+            show_window_notification("模型正在加载中，请稍后再试", position=self.notification_position, level='info')
             return
         
         if not self.nn:
             self.log_error("神经网络未初始化")
-            show_window_notification("模型未加载，无法训练", level='error')
+            show_window_notification("模型未加载，无法训练", position=self.notification_position, level='error')
             return
         
         if not self.brightness_data:
             self.log_error("没有足够的亮度数据进行训练")
-            show_window_notification("没有亮度数据，请先获取亮度", level='warning')
+            show_window_notification("没有亮度数据，请先获取亮度", position=self.notification_position, level='warning')
             return
         
         # 检查显示器可用性（训练需要应用亮度）
         if not self.available_monitors:
             self.log_warning("没有可用的显示器，无法训练")
-            show_window_notification("没有可用的显示器，无法训练", level='warning')
+            show_window_notification("没有可用的显示器，无法训练", position=self.notification_position, level='warning')
             return
         
         # 应用当前亮度设置
@@ -739,13 +779,13 @@ class BrightnessManagerApp:
         
         # 点击频率过高，拒绝本次点击
         remaining_time = self.button_click_interval - (current_time - last_click_time)
-        self.log_info(f"按钮 [{button_name}] 点击频率过高，请等待 {remaining_time:.1f} 秒后再试")
+        self.log_info(f"按钮 [{button_name}] 点击频率过高，请稍后再试")
         return False
     
     def on_get_brightness_click(self):
         """获取亮度按钮点击回调"""
         if not self.can_click_button("get_brightness"):
-            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            show_window_notification("操作过于频繁，请稍后再试", position=self.notification_position, level='warning')
             return
         
         threading.Thread(target=self.get_brightness_data, daemon=True).start()
@@ -753,11 +793,11 @@ class BrightnessManagerApp:
     def get_brightness_data(self):
         """获取亮度数据"""
         self.log_info("正在获取亮度数据...")
-        self.root.after(0, lambda: show_window_notification("正在获取亮度...", level='info'))
+        self.root.after(0, lambda: show_window_notification("正在获取亮度...", position=self.notification_position, level='info'))
         try:
             # 检查设备可用性
             if not self._check_devices_available():
-                self.root.after(0, lambda: show_window_notification("摄像头不可用，无法获取亮度", level='error'))
+                self.root.after(0, lambda: show_window_notification("摄像头不可用，无法获取亮度", position=self.notification_position, level='error'))
                 return
             
             # 获取选中的摄像头索引
@@ -765,7 +805,7 @@ class BrightnessManagerApp:
             
             if camera_index is None:
                 self.log_error("无效的摄像头选择")
-                self.root.after(0, lambda: show_window_notification("摄像头不可用，无法获取亮度", level='error'))
+                self.root.after(0, lambda: show_window_notification("摄像头不可用，无法获取亮度", position=self.notification_position, level='error'))
                 return
             
             # 捕获图像帧，减少帧数以提升性能
@@ -773,7 +813,7 @@ class BrightnessManagerApp:
             
             if not frames:
                 self.log_error("无法从摄像头捕获图像，可能摄像头被占用或已断开")
-                self.root.after(0, lambda: show_window_notification("无法获取摄像头图像", level='error'))
+                self.root.after(0, lambda: show_window_notification("无法获取摄像头图像", position=self.notification_position, level='error'))
                 return
             
             # 计算当前亮度和其他特征，返回(current_brightness, features)元组
@@ -798,10 +838,10 @@ class BrightnessManagerApp:
                 self.log_info(f"神经网络推荐亮度: {predicted_brightness}%")
             else:
                 self.log_error("神经网络未初始化")
-                self.root.after(0, lambda: show_window_notification("模型未加载，无法预测亮度", level='error'))
+                self.root.after(0, lambda: show_window_notification("模型未加载，无法预测亮度", position=self.notification_position, level='error'))
         except Exception as e:
-            self.log_error(f"获取亮度数据失败: {e}")
-            self.root.after(0, lambda: show_window_notification(f"获取亮度失败: {e}", level='error'))
+            self.log_error(f"获取亮度数据失败：{e}")
+            self.root.after(0, lambda: show_window_notification(f"获取亮度失败：{e}", position=self.notification_position, level='error'))
     
     def toggle_auto_brightness(self):
         """切换自动亮度调整"""
@@ -860,7 +900,7 @@ class BrightnessManagerApp:
                 return
             
             # 显示调整开始通知 - 在主线程执行
-            self.root.after(0, lambda: show_window_notification("正在自动调整亮度...", level='info'))
+            self.root.after(0, lambda: show_window_notification("正在自动调整亮度...", position=self.notification_position, level='info'))
             # 设置超时机制，避免长时间阻塞
             def run_with_timeout():
                 try:
@@ -909,16 +949,18 @@ class BrightnessManagerApp:
                         # 在所有需要调整的屏幕上显示通知
                         indices_copy = list(monitor_indices)
                         brightness_val = predicted_brightness
+                        notification_pos = self.notification_position
                         self.root.after(0, lambda: [
                             show_notification(
                                 f"亮度已自动调整为 {brightness_val}%", 
+                                position=notification_pos,
                                 screen_mode='custom', 
                                 screen_index=idx, 
                                 level='success'
                             )
                             for idx in indices_copy
                         ])
-                        self.log_info(f"自动调整亮度为: {predicted_brightness}%")
+                        self.log_info(f"自动调整亮度为：{predicted_brightness}%")
                     else:
                         self._handle_auto_adjust_failure("自动调整亮度失败，显示器可能不支持亮度调节")
                 except Exception as e:
@@ -936,14 +978,14 @@ class BrightnessManagerApp:
                 error_msg = "自动调整亮度线程超时"
                 self.log_error(error_msg)
                 # 显示错误通知 - 在主线程执行
-                self.root.after(0, lambda: show_window_notification(error_msg, level='error'))
+                self.root.after(0, lambda: show_window_notification(error_msg, position=self.notification_position, level='error'))
                 
         except Exception as e:
             # 忽略错误，确保程序稳定性
-            error_msg = f"自动调整亮度时出错: {e}"
+            error_msg = f"自动调整亮度时出错：{e}"
             self.log_error(error_msg)
             # 显示错误通知 - 在主线程执行
-            self.root.after(0, lambda: show_window_notification(error_msg, level='error'))
+            self.root.after(0, lambda: show_window_notification(error_msg, position=self.notification_position, level='error'))
     
     def _check_devices_available(self):
         """检查设备（摄像头和显示器）是否可用
@@ -980,7 +1022,7 @@ class BrightnessManagerApp:
             error_msg: 错误信息
         """
         self.log_error(error_msg)
-        self.root.after(0, lambda msg=error_msg: show_window_notification(msg, level='error'))
+        self.root.after(0, lambda msg=error_msg: show_window_notification(msg, position=self.notification_position, level='error'))
     
     def on_startup_change(self):
         """开机自启动设置变化回调"""
@@ -994,8 +1036,8 @@ class BrightnessManagerApp:
             self.log_info(f"{status}开机自启动")
         else:
             self.log_error("设置开机自启动失败")
-            # 使用Tkinter的after方法在主线程显示通知
-            self.root.after(0, lambda: show_window_notification("设置开机自启动失败", level='error'))
+            # 使用 Tkinter 的 after 方法在主线程显示通知
+            self.root.after(0, lambda: show_window_notification("设置开机自启动失败", position=self.notification_position, level='error'))
     
     def on_interval_change(self, event):
         """循环检查间隔变化回调"""
@@ -1048,12 +1090,12 @@ class BrightnessManagerApp:
     def on_refresh_cameras(self):
         """手动刷新摄像头列表"""
         if not self.can_click_button("refresh_cameras"):
-            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            show_window_notification("操作过于频繁，请稍后再试", position=self.notification_position, level='warning')
             return
         
         self.log_info("正在刷新摄像头列表...")
         self.refresh_camera_list(force_refresh=True)
-        show_window_notification("摄像头列表已刷新", level='success')
+        show_window_notification("摄像头列表已刷新", position=self.notification_position, level='success')
     
     def refresh_monitor_list(self, restore_selection=True, force_refresh=False):
         """刷新显示器列表
@@ -1106,6 +1148,7 @@ class BrightnessManagerApp:
                     # 显示通知提醒用户
                     self.root.after(1000, lambda: show_window_notification(
                         "部分显示器已断开连接，已自动调整选择",
+                        position=self.notification_position,
                         level='warning'
                     ))
             
@@ -1119,12 +1162,12 @@ class BrightnessManagerApp:
     def on_refresh_monitors(self):
         """手动刷新显示器列表"""
         if not self.can_click_button("refresh_monitors"):
-            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            show_window_notification("操作过于频繁，请稍后再试", position=self.notification_position, level='warning')
             return
         
         self.log_info("正在刷新显示器列表...")
         self.refresh_monitor_list(force_refresh=True)
-        show_window_notification("显示器列表已刷新", level='success')
+        show_window_notification("显示器列表已刷新", position=self.notification_position, level='success')
     
     def on_camera_change(self, event):
         """摄像头选择变化回调"""
@@ -1163,11 +1206,11 @@ class BrightnessManagerApp:
                 new_camera = self.available_cameras[0]['name']
                 self.camera_var.set(new_camera)
                 config_manager.set('selected_camera_name', new_camera)
-                show_window_notification(f"摄像头已断开，已自动切换到: {new_camera}", level='warning')
+                show_window_notification(f"摄像头已断开，已自动切换到：{new_camera}", position=self.notification_position, level='warning')
             else:
                 # 没有任何可用摄像头
                 self.camera_var.set('')
-                show_window_notification("所有摄像头已断开，无法获取环境亮度", level='error')
+                show_window_notification("所有摄像头已断开，无法获取环境亮度", position=self.notification_position, level='error')
     
     def _handle_selected_monitors_unavailable(self, removed_monitors):
         """处理选中的显示器不可用的情况"""
@@ -1190,9 +1233,9 @@ class BrightnessManagerApp:
             config_manager.set('selected_monitor_names', new_selected)
             
             if new_selected:
-                show_window_notification(f"显示器已断开，已自动选择: {', '.join(new_selected)}", level='warning')
+                show_window_notification(f"显示器已断开，已自动选择：{', '.join(new_selected)}", position=self.notification_position, level='warning')
             else:
-                show_window_notification("所有显示器已断开，无法调整亮度", level='error')
+                show_window_notification("所有显示器已断开，无法调整亮度", position=self.notification_position, level='error')
     
     def start_hotplug_detection(self):
         """启动热插拔检测定时器"""
@@ -1220,16 +1263,16 @@ class BrightnessManagerApp:
                 # 如果刷新后还是没有找到选中的摄像头
                 if selected_camera not in [c['name'] for c in self.available_cameras]:
                     self.log_warning(f"摄像头 '{selected_camera}' 已断开")
-                    show_window_notification(f"摄像头已断开：{selected_camera}", level='warning')
+                    show_window_notification(f"摄像头已断开：{selected_camera}", position=self.notification_position, level='warning')
                     # 自动切换到第一个可用摄像头
                     if self.available_cameras:
                         new_camera = self.available_cameras[0]['name']
                         self.camera_var.set(new_camera)
                         config_manager.set('selected_camera_name', new_camera)
-                        show_window_notification(f"已自动切换到：{new_camera}", level='info')
+                        show_window_notification(f"已自动切换到：{new_camera}", position=self.notification_position, level='info')
                     else:
                         self.camera_var.set('')
-                        show_window_notification("所有摄像头已断开，无法获取环境亮度", level='error')
+                        show_window_notification("所有摄像头已断开，无法获取环境亮度", position=self.notification_position, level='error')
         elif not self.available_cameras:
             # 没有任何摄像头，尝试刷新
             self.refresh_camera_list(restore_selection=False, force_refresh=True)
@@ -1256,7 +1299,7 @@ class BrightnessManagerApp:
                 self.refresh_monitor_list(restore_selection=True, force_refresh=True)
                 
                 # 通知用户
-                show_window_notification(f"显示器已断开：{', '.join(unavailable_monitors)}", level='warning')
+                show_window_notification(f"显示器已断开：{', '.join(unavailable_monitors)}", position=self.notification_position, level='warning')
                 
                 # 自动切换到可用的显示器
                 self._handle_selected_monitors_unavailable(unavailable_monitors)
@@ -1542,9 +1585,60 @@ if __name__ == "__main__":
     # 检查是否为单实例运行
     if not is_single_instance():
         print("应用程序已经在运行中！")
-        # 直接显示通知，因为此时还没有创建Tkinter实例
-        show_startup_notification(f"应用程序已经在运行中！", level='warning')
-        sys.exit(0)
+        # 使用 PyQt5 消息框显示重复实例警告
+        from PyQt5.QtWidgets import QMessageBox
+        from notification import get_app
+        
+        # 确保 QApplication 存在
+        app = get_app()
+        
+        # 创建消息框
+        msg_box = QMessageBox()
+        msg_box.setIcon(QMessageBox.Warning)
+        msg_box.setWindowTitle("应用程序已在运行")
+        msg_box.setText("亮度管理器已经在运行中！")
+        msg_box.setStandardButtons(QMessageBox.Ok | QMessageBox.Abort)
+        msg_box.setWindowFlags(msg_box.windowFlags() | Qt.WindowStaysOnTopHint)
+        
+        # 自定义按钮文本
+        ok_button = msg_box.button(QMessageBox.Ok)
+        ok_button.setText("取消")
+        abort_button = msg_box.button(QMessageBox.Abort)
+        abort_button.setText("结束已有实例并启动")
+        
+        # 显示消息框并等待用户确认
+        result = msg_box.exec_()
+        
+        # 如果用户选择"结束已有实例并启动"
+        if result == QMessageBox.Abort:
+            # 结束已有实例
+            try:
+                hwnd = find_window("亮度管理器")
+                if hwnd:
+                    import win32process
+                    pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+                    handle = win32api.OpenProcess(win32con.PROCESS_TERMINATE, False, pid)
+                    win32api.TerminateProcess(handle, 0)
+                    win32api.CloseHandle(handle)
+                    print(f"已结束已有实例 (PID: {pid})")
+                    
+                    # 短暂等待，确保进程已完全退出
+                    time.sleep(0.5)
+                    
+                    # 释放互斥量，允许新实例启动
+                    if _global_mutex:
+                        win32event.CloseHandle(_global_mutex)
+                        _global_mutex = None
+                    
+                    # 继续启动新实例
+                    print("正在启动新实例...")
+                else:
+                    print("未找到已有实例窗口")
+            except Exception as e:
+                print(f"结束已有实例失败：{e}")
+        else:
+            # 用户选择取消，退出程序
+            sys.exit(0)
     
     # 显示启动通知
     show_startup_notification("正在启动亮度管理器", level='info')

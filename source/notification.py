@@ -425,15 +425,17 @@ def show_startup_notification(message="系统启动", level='info'):
     return show_notification(message, position='top', screen_mode='primary', level=level)
 
 
-def show_window_notification(message, position='top', level='info'):
+def show_window_notification(message, position=None, level='info'):
     """
     显示窗口操作通知（在窗口所在屏幕上显示）
     
     Args:
         message: 通知消息
-        position: 通知位置
+        position: 通知位置，None 则使用默认值 'top'
         level: 通知级别
     """
+    if position is None:
+        position = 'top'
     return show_notification(
         message, 
         position=position, 
@@ -442,25 +444,27 @@ def show_window_notification(message, position='top', level='info'):
     )
 
 
-def show_cursor_notification(message, position='top', level='info'):
+def show_cursor_notification(message, position=None, level='info'):
     """
     显示鼠标位置通知（在鼠标所在屏幕上显示）
     
     Args:
         message: 通知消息
-        position: 通知位置
+        position: 通知位置，None 则使用默认值 'top'
         level: 通知级别
     """
+    if position is None:
+        position = 'top'
     return show_notification(message, position=position, screen_mode='cursor', level=level)
 
 
-def show_all_screens_notification(message, position='top', level='info'):
+def show_all_screens_notification(message, position=None, level='info'):
     """
     在所有屏幕上显示通知
     
     Args:
         message: 通知消息
-        position: 通知位置
+        position: 通知位置，None 则使用默认值 'top'
         level: 通知级别
     """
     return show_notification(message, position=position, screen_mode='all', level=level)
