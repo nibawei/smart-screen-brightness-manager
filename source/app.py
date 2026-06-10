@@ -154,6 +154,10 @@ class BrightnessManagerApp:
         self.model_loading = False  # 模型是否正在加载
         self.model_loaded = False  # 模型是否加载完成
         
+        # 按钮点击频率限制
+        self.button_click_locks = {}  # 按钮点击锁，记录每个按钮的最后点击时间
+        self.button_click_interval = 2.0  # 按钮点击最小间隔（秒）
+        
         # 创建GUI
         self.create_gui()
         
@@ -550,6 +554,12 @@ class BrightnessManagerApp:
                 menu
             )
             
+            # 设置左键点击回调
+            def on_tray_clicked(icon, item):
+                self.show_gui()
+            
+            self.tray.on_clicked = on_tray_clicked
+            
             # 启动系统托盘
             threading.Thread(target=self.tray.run, daemon=True).start()
         except Exception as e:
@@ -585,6 +595,11 @@ class BrightnessManagerApp:
     
     def apply_brightness(self):
         """应用亮度设置"""
+        # 检查按钮点击频率
+        if not self.can_click_button("apply_brightness"):
+            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            return
+        
         # 检查模型是否正在加载
         if self.model_loading:
             self.log_info("模型正在加载中，请稍后再试")
@@ -634,6 +649,11 @@ class BrightnessManagerApp:
     
     def train_network(self):
         """训练神经网络"""
+        # 检查按钮点击频率
+        if not self.can_click_button("train_network"):
+            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            return
+        
         # 检查模型是否正在加载
         if self.model_loading:
             self.log_info("模型正在加载中，请稍后再试")
@@ -694,13 +714,46 @@ class BrightnessManagerApp:
         except Exception as e:
             self.log_error(f"训练神经网络失败: {e}")
     
+    def can_click_button(self, button_name):
+        """检查按钮是否可以点击（频率限制）
+        
+        Args:
+            button_name: 按钮名称标识
+            
+        Returns:
+            bool: 是否可以点击
+        """
+        import time
+        current_time = time.time()
+        
+        # 检查该按钮是否有点击记录
+        if button_name not in self.button_click_locks:
+            self.button_click_locks[button_name] = current_time
+            return True
+        
+        # 检查距离上次点击的时间间隔
+        last_click_time = self.button_click_locks[button_name]
+        if current_time - last_click_time >= self.button_click_interval:
+            self.button_click_locks[button_name] = current_time
+            return True
+        
+        # 点击频率过高，拒绝本次点击
+        remaining_time = self.button_click_interval - (current_time - last_click_time)
+        self.log_info(f"按钮 [{button_name}] 点击频率过高，请等待 {remaining_time:.1f} 秒后再试")
+        return False
+    
     def on_get_brightness_click(self):
         """获取亮度按钮点击回调"""
+        if not self.can_click_button("get_brightness"):
+            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            return
+        
         threading.Thread(target=self.get_brightness_data, daemon=True).start()
 
     def get_brightness_data(self):
         """获取亮度数据"""
         self.log_info("正在获取亮度数据...")
+        self.root.after(0, lambda: show_window_notification("正在获取亮度...", level='info'))
         try:
             # 检查设备可用性
             if not self._check_devices_available():
@@ -994,6 +1047,10 @@ class BrightnessManagerApp:
     
     def on_refresh_cameras(self):
         """手动刷新摄像头列表"""
+        if not self.can_click_button("refresh_cameras"):
+            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            return
+        
         self.log_info("正在刷新摄像头列表...")
         self.refresh_camera_list(force_refresh=True)
         show_window_notification("摄像头列表已刷新", level='success')
@@ -1061,6 +1118,10 @@ class BrightnessManagerApp:
     
     def on_refresh_monitors(self):
         """手动刷新显示器列表"""
+        if not self.can_click_button("refresh_monitors"):
+            show_window_notification("操作过于频繁，请稍后再试", level='warning')
+            return
+        
         self.log_info("正在刷新显示器列表...")
         self.refresh_monitor_list(force_refresh=True)
         show_window_notification("显示器列表已刷新", level='success')
