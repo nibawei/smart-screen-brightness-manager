@@ -54,14 +54,13 @@ def is_monitor_on():
     Check if the monitor is currently on by querying the power state
     Returns True if monitor is on, False if it's off/sleeping
     """
+    com_initialized = False
     try:
         # Method 1: Try using WMI to check monitor status
         try:
             # 初始化COM（每次调用都需要初始化，因为可能在不同的线程中）
-            try:
-                pythoncom.CoInitialize()
-            except:
-                pass
+            pythoncom.CoInitialize()
+            com_initialized = True
             
             wmi_obj = wmi.WMI(namespace='root\\wmi')
             # Query the monitor power state
@@ -72,21 +71,28 @@ def is_monitor_on():
                     return state.PowerState == 1
             # If no specific state found, assume monitor is on
             return True
-        except Exception:
+        except wmi.x_wmi:
+            # WMI相关异常
+            return True
+        except pythoncom.com_error:
+            # COM相关异常
+            return True
+        except Exception as e:
             # Method 2: Alternative approach using Windows API
             # We can try to send a message to check if the monitor responds
             # However, since we can't reliably detect if monitor is off via API,
             # we'll return True as a fallback to prevent disabling brightness adjustments
             return True
-    except Exception:
+    except Exception as e:
         # If all methods fail, assume monitor is on to maintain functionality
         return True
     finally:
-        # 清理COM（确保总是被调用）
-        try:
-            pythoncom.CoUninitialize()
-        except:
-            pass
+        # 清理COM（确保总是被调用，且只在成功初始化后清理）
+        if com_initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except pythoncom.com_error:
+                pass
 
 from liangdu import BrightnessNeuralNetwork, capture_frames_from_camera, calculate_average_brightness, adjust_brightness, generate_synthetic_data, get_available_cameras, get_available_monitors
 from config import config_manager
@@ -158,6 +164,13 @@ class BrightnessManagerApp:
         # 按钮点击频率限制
         self.button_click_locks = {}  # 按钮点击锁，记录每个按钮的最后点击时间
         self.button_click_interval = 2.0  # 按钮点击最小间隔（秒）
+        
+        # 线程安全锁
+        self.nn_lock = threading.Lock()  # 神经网络模型访问锁
+        self.data_lock = threading.Lock()  # 亮度数据访问锁
+        self.camera_lock = threading.Lock()  # 摄像头列表访问锁
+        self.monitor_lock = threading.Lock()  # 显示器列表访问锁
+        self.status_lock = threading.Lock()  # 状态标志访问锁
         
         # 创建GUI
         self.create_gui()
@@ -819,17 +832,22 @@ class BrightnessManagerApp:
             # 计算当前亮度和其他特征，返回(current_brightness, features)元组
             current_brightness, features = calculate_average_brightness(frames)
             
-            # 缓存亮度数据
-            self.brightness_data.append(features)
-            # 限制缓存大小，避免内存占用过大
-            if len(self.brightness_data) > 100:
-                self.brightness_data = self.brightness_data[-100:]
+            # 缓存亮度数据（线程安全）
+            with self.data_lock:
+                self.brightness_data.append(features)
+                # 限制缓存大小，避免内存占用过大
+                if len(self.brightness_data) > 100:
+                    self.brightness_data = self.brightness_data[-100:]
             
-            # 使用神经网络预测亮度
-            if self.nn:
-                predicted_brightness = self.nn.forward(features)
-                predicted_brightness = int(predicted_brightness)
-                
+            # 使用神经网络预测亮度（线程安全）
+            with self.nn_lock:
+                if self.nn:
+                    predicted_brightness = self.nn.forward(features)
+                    predicted_brightness = int(predicted_brightness)
+                else:
+                    predicted_brightness = None
+            
+            if predicted_brightness is not None:
                 # 更新滑动条位置
                 self.brightness_var.set(predicted_brightness)
                 self.brightness_label.config(text=f"亮度: {predicted_brightness}%")
@@ -919,26 +937,27 @@ class BrightnessManagerApp:
                         self._handle_auto_adjust_failure("无法从摄像头获取图像，可能摄像头被占用或已断开")
                         return
                     
-                    if not self.nn:
-                        self._handle_auto_adjust_failure("神经网络模型未加载，无法预测亮度")
-                        return
-                    
                     # 计算当前亮度和其他特征，返回(current_brightness, features)元组
                     current_brightness, features = calculate_average_brightness(frames)
                     
-                    # 缓存亮度数据
-                    self.brightness_data.append(features)
-                    # 限制缓存大小
-                    if len(self.brightness_data) > 100:
-                        self.brightness_data = self.brightness_data[-100:]
+                    # 缓存亮度数据（线程安全）
+                    with self.data_lock:
+                        self.brightness_data.append(features)
+                        # 限制缓存大小
+                        if len(self.brightness_data) > 100:
+                            self.brightness_data = self.brightness_data[-100:]
                     
-                    # 使用神经网络预测亮度
-                    predicted_brightness = self.nn.forward(features)
-                    predicted_brightness = int(predicted_brightness)
+                    # 使用神经网络预测亮度（线程安全）
+                    with self.nn_lock:
+                        if not self.nn:
+                            self._handle_auto_adjust_failure("神经网络模型未加载，无法预测亮度")
+                            return
+                        predicted_brightness = self.nn.forward(features)
+                        predicted_brightness = int(predicted_brightness)
                     
-                    # 调整亮度
-                    # 获取选中的显示器索引列表
-                    monitor_indices = self.get_selected_monitor_indices()
+                    # 获取选中的显示器索引列表（线程安全）
+                    with self.monitor_lock:
+                        monitor_indices = self.get_selected_monitor_indices()
                     
                     if not monitor_indices:
                         self._handle_auto_adjust_failure("没有可用的显示器，已跳过亮度调整")
@@ -1490,10 +1509,11 @@ def is_single_instance():
         pids = win32process.EnumProcesses()
         
         for pid in pids:
-            if pid == 0:
-                continue  # 跳过无效进程ID
-            
+            handle = None
             try:
+                if pid == 0:
+                    continue  # 跳过无效进程ID
+                
                 # 打开进程
                 handle = win32api.OpenProcess(win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ, False, pid)
                 
@@ -1508,13 +1528,20 @@ def is_single_instance():
                             count += 1
                             if count > 1:
                                 # 已有其他实例运行
-                                win32api.CloseHandle(handle)
                                 return False
-                    finally:
-                        win32api.CloseHandle(handle)
-            except Exception:
-                # 忽略无法访问的进程
+                    except win32process.error as e:
+                        # 无法获取进程信息，跳过
+                        pass
+            except win32api.error as e:
+                # 无法打开进程（可能权限不足），跳过
                 pass
+            finally:
+                # 确保进程句柄总是被关闭
+                if handle:
+                    try:
+                        win32api.CloseHandle(handle)
+                    except win32api.error:
+                        pass
         
         # 如果只有一个进程（当前进程），继续检查文件锁
         if count == 1:

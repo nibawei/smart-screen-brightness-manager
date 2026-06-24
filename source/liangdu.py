@@ -106,12 +106,14 @@ def get_available_monitors(force_refresh=False):
             return _monitor_cache['monitors']
     
     monitors = []
+    com_initialized = False
     
     try:
         # 初始化 COM（WMI 需要）
         try:
             pythoncom.CoInitialize()
-        except:
+            com_initialized = True
+        except pythoncom.com_error:
             pass
         
         # 使用 WMI 获取显示器信息
@@ -130,7 +132,7 @@ def get_available_monitors(force_refresh=False):
                         name_str = ''.join([chr(b) for b in name_bytes if b != 0 and b < 128])
                         if name_str.strip():
                             name = name_str.strip()
-                    except:
+                    except (UnicodeDecodeError, TypeError):
                         pass
                 
                 monitors.append({
@@ -144,13 +146,11 @@ def get_available_monitors(force_refresh=False):
                     'index': i,
                     'name': f'显示器 {i+1}'
                 })
-        
-        # 清理 COM
-        try:
-            pythoncom.CoUninitialize()
-        except:
-            pass
             
+    except wmi.x_wmi as e:
+        print(f"使用 WMI 获取显示器列表失败：{e}")
+    except pythoncom.com_error as e:
+        print(f"COM 初始化失败：{e}")
     except Exception as e:
         print(f"使用 WMI 获取显示器列表失败：{e}")
         # 如果 WMI 方法失败，使用 Windows API 枚举显示器
@@ -182,6 +182,8 @@ def get_available_monitors(force_refresh=False):
                     'index': i,
                     'name': f'显示器 {i+1}'
                 })
+        except ImportError as e2:
+            print(f"导入 ctypes 失败：{e2}")
         except Exception as e2:
             print(f"备用方法获取显示器列表失败：{e2}")
             # 如果所有方法都失败，至少添加一个默认显示器
@@ -189,6 +191,13 @@ def get_available_monitors(force_refresh=False):
                 'index': 0,
                 'name': '默认显示器'
             })
+    finally:
+        # 清理 COM（只在成功初始化后清理）
+        if com_initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except pythoncom.com_error:
+                pass
     
     # 如果没有找到任何显示器，添加一个默认显示器
     if not monitors:
@@ -497,24 +506,32 @@ def adjust_brightness(target_brightness, monitor_indices=None):
                                         print(f"显示器 {i} 亮度设置成功")
                                         success = True
                                         break
-                                    except Exception as e:
+                                    except wmi.x_wmi as e:
                                         print(f"使用超时 {timeout} 设置亮度失败: {str(e)}")
-                            except Exception as e:
-                                print(f"设置显示器 {i} 亮度时出错: {str(e)}")
+                                    except pythoncom.com_error as e:
+                                        print(f"COM错误，使用超时 {timeout} 设置亮度失败: {str(e)}")
+                            except wmi.x_wmi as e:
+                                print(f"设置显示器 {i} 亮度时WMI出错: {str(e)}")
+                            except pythoncom.com_error as e:
+                                print(f"设置显示器 {i} 亮度时COM出错: {str(e)}")
                         if success:
                             break
                     else:
                         print(f"在命名空间 {namespace} 中未找到显示器")
-                except Exception as e:
-                    print(f"访问命名空间 {namespace} 时出错: {str(e)}")
+                except wmi.x_wmi as e:
+                    print(f"访问命名空间 {namespace} 时WMI出错: {str(e)}")
+                except pythoncom.com_error as e:
+                    print(f"访问命名空间 {namespace} 时COM出错: {str(e)}")
             
             if success:
                 print(f"屏幕亮度已成功设置为: {brightness}%")
                 return True
         except ImportError:
             print("wmi模块未安装")
-        except Exception as e:
+        except wmi.x_wmi as e:
             print(f"WMI方法出错: {str(e)}")
+        except pythoncom.com_error as e:
+            print(f"WMI方法COM错误: {str(e)}")
         
         # 方法2: 使用Windows API - 更底层的方法
         print("尝试使用Windows API设置亮度...")
@@ -536,8 +553,10 @@ def adjust_brightness(target_brightness, monitor_indices=None):
             # 注意：这里只是演示，实际的SetMonitorBrightness调用需要更复杂的实现
             # 由于权限和兼容性问题，我们会在下面提供一个更简单的方法
             
-        except Exception as e:
-            print(f"Windows API方法出错: {str(e)}")
+        except ctypes.WinError as e:
+            print(f"Windows API方法WinError: {str(e)}")
+        except AttributeError as e:
+            print(f"Windows API方法属性错误: {str(e)}")
         
         # 方法3: 使用Registry方法 - 适用于某些系统
         print("尝试使用注册表方法设置亮度...")
@@ -551,13 +570,15 @@ def adjust_brightness(target_brightness, monitor_indices=None):
                 # 注意：实际的注册表键可能因系统而异
                 print("注册表访问成功")
                 winreg.CloseKey(key)
-            except Exception as e:
+            except FileNotFoundError:
+                print(f"注册表路径不存在: {key_path}")
+            except PermissionError:
+                print(f"没有权限访问注册表: {key_path}")
+            except OSError as e:
                 print(f"注册表访问出错: {str(e)}")
                 
         except ImportError:
             print("winreg模块不可用")
-        except Exception as e:
-            print(f"注册表方法出错: {str(e)}")
         
         # 方法4: 使用PowerShell命令 - 最可靠的方法
         print("尝试使用PowerShell命令设置亮度...")
@@ -576,8 +597,12 @@ def adjust_brightness(target_brightness, monitor_indices=None):
             else:
                 print(f"PowerShell命令执行失败: {result.stderr}")
                 
-        except Exception as e:
-            print(f"PowerShell方法出错: {str(e)}")
+        except FileNotFoundError:
+            print("PowerShell命令未找到")
+        except subprocess.CalledProcessError as e:
+            print(f"PowerShell命令执行错误: {str(e)}")
+        except OSError as e:
+            print(f"PowerShell方法系统错误: {str(e)}")
         
         # 如果所有方法都失败
         print("警告: 所有设置亮度的方法都失败了")
@@ -588,6 +613,9 @@ def adjust_brightness(target_brightness, monitor_indices=None):
         
         return False
         
+    except ValueError as e:
+        print(f"设置亮度时参数错误: {str(e)}")
+        return False
     except Exception as e:
         print(f"设置亮度时出错: {str(e)}")
         return False
