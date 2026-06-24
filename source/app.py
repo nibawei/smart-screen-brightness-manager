@@ -55,37 +55,33 @@ def is_monitor_on():
     Returns True if monitor is on, False if it's off/sleeping
     """
     com_initialized = False
+    result = True
     try:
+        # 初始化COM（每次调用都需要初始化，因为可能在不同的线程中）
+        pythoncom.CoInitialize()
+        com_initialized = True
+        
         # Method 1: Try using WMI to check monitor status
-        try:
-            # 初始化COM（每次调用都需要初始化，因为可能在不同的线程中）
-            pythoncom.CoInitialize()
-            com_initialized = True
-            
-            wmi_obj = wmi.WMI(namespace='root\\wmi')
-            # Query the monitor power state
-            monitor_states = wmi_obj.WmiMonitorBasicDisplayParams()
-            for state in monitor_states:
-                # Power state: 1=ON, 2=STANDBY, 3=SUSPEND, 4=OFF
-                if hasattr(state, 'PowerState'):
-                    return state.PowerState == 1
-            # If no specific state found, assume monitor is on
-            return True
-        except wmi.x_wmi:
-            # WMI相关异常
-            return True
-        except pythoncom.com_error:
-            # COM相关异常
-            return True
-        except Exception as e:
-            # Method 2: Alternative approach using Windows API
-            # We can try to send a message to check if the monitor responds
-            # However, since we can't reliably detect if monitor is off via API,
-            # we'll return True as a fallback to prevent disabling brightness adjustments
-            return True
+        wmi_obj = wmi.WMI(namespace='root\\wmi')
+        # Query the monitor power state
+        monitor_states = wmi_obj.WmiMonitorBasicDisplayParams()
+        for state in monitor_states:
+            # Power state: 1=ON, 2=STANDBY, 3=SUSPEND, 4=OFF
+            if hasattr(state, 'PowerState'):
+                result = state.PowerState == 1
+                break
+    except wmi.x_wmi:
+        # WMI相关异常，保持默认结果True
+        pass
+    except pythoncom.com_error:
+        # COM相关异常，保持默认结果True
+        pass
     except Exception as e:
-        # If all methods fail, assume monitor is on to maintain functionality
-        return True
+        # Method 2: Alternative approach using Windows API
+        # We can try to send a message to check if the monitor responds
+        # However, since we can't reliably detect if monitor is off via API,
+        # we'll return True as a fallback to prevent disabling brightness adjustments
+        pass
     finally:
         # 清理COM（确保总是被调用，且只在成功初始化后清理）
         if com_initialized:
@@ -93,6 +89,8 @@ def is_monitor_on():
                 pythoncom.CoUninitialize()
             except pythoncom.com_error:
                 pass
+    
+    return result
 
 from liangdu import BrightnessNeuralNetwork, capture_frames_from_camera, calculate_average_brightness, adjust_brightness, generate_synthetic_data, get_available_cameras, get_available_monitors
 from config import config_manager
