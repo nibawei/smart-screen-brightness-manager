@@ -110,8 +110,11 @@ def get_available_monitors(force_refresh=False):
     
     try:
         # 初始化 COM（WMI 需要）
-        pythoncom.CoInitialize()
-        com_initialized = True
+        try:
+            pythoncom.CoInitialize()
+            com_initialized = True
+        except pythoncom.com_error:
+            pass
         
         # 使用 WMI 获取显示器信息
         wmi_obj = wmi.WMI(namespace='root\\wmi')
