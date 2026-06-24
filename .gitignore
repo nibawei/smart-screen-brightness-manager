@@ -37,3 +37,4 @@ env/
 .trae/
 *.db
 *.sqlite
+*.npz
