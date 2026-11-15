@@ -21,6 +21,12 @@ class GammaRampTest(unittest.TestCase):
         self.assertLess(dim[128], full[128])
         self.assertGreater(dim[255], 0)
 
+    def test_white_is_dimmed_too(self):
+        # 比例压暗：白点也要下降，否则用户设低亮度仍觉得屏幕亮
+        dim = liangdu._build_gamma_ramp(50)
+        self.assertLess(dim[255], 65535 * 0.7)
+        self.assertAlmostEqual(dim[255], round(65535 * (0.06 + 0.94 * 0.5)), delta=2)
+
     def test_monotone_and_clamped(self):
         for level in (-10, 0, 25, 50, 75, 100, 150):
             ramp = liangdu._build_gamma_ramp(level)
@@ -165,6 +171,36 @@ class SetTargetsTest(unittest.TestCase):
         self.assertTrue(result["scr-a"]["ok"])
         self.assertEqual(result["scr-a"]["backend"], "ddc")
         self.assertEqual(calls, ["wmi", "ddc"])
+
+    def test_external_wmi_without_readback_falls_back(self):
+        # 外接屏 WMI「调用成功但读不到回读值」时不能算成功，否则屏幕看起来没变（偏亮）
+        calls = []
+        originals = (liangdu._wmi_set, liangdu._gamma_set)
+        liangdu._wmi_set = lambda *args, **kwargs: (calls.append("wmi"), (True, None, ""))[1]
+        liangdu._gamma_set = lambda *args, **kwargs: (calls.append("gamma"), (True, 50, ""))[1]
+        screen = self.screen(["wmi", "gamma"])
+        screen["params"] = {"connection": "HDMI"}
+        try:
+            result = liangdu.set_brightness_targets({"scr-a": 50}, screens=[screen], verify=True)
+        finally:
+            liangdu._wmi_set, liangdu._gamma_set = originals
+
+        self.assertTrue(result["scr-a"]["ok"])
+        self.assertEqual(result["scr-a"]["backend"], "gamma")
+        self.assertEqual(calls, ["wmi", "gamma"])
+
+    def test_internal_wmi_without_readback_is_accepted(self):
+        originals = liangdu._wmi_set
+        liangdu._wmi_set = lambda *args, **kwargs: (True, None, "")
+        screen = self.screen(["wmi", "gamma"])
+        screen["params"] = {"connection": "内置屏"}
+        try:
+            result = liangdu.set_brightness_targets({"scr-a": 50}, screens=[screen], verify=True)
+        finally:
+            liangdu._wmi_set = originals
+
+        self.assertTrue(result["scr-a"]["ok"])
+        self.assertEqual(result["scr-a"]["backend"], "wmi")
 
 
 if __name__ == "__main__":

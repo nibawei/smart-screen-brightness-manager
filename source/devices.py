@@ -656,16 +656,28 @@ def enumerate_wmi_screens():
             key = _normalize_device_id(device.get("device_id"))
             if key:
                 display_map[key] = device
-        # InstanceName 与 DeviceID 完全对不上时的兜底：两者通常按同一设备顺序枚举
-        ordered_devices = [device for device in display_devices if device.get("device_id")]
-        order_fallback = not display_map and len(ordered_devices) == len(monitor_ids)
+
+        # 先按 InstanceName ↔ DeviceID 精确匹配
+        matched_devices = []
+        matched_keys = set()
+        for monitor in monitor_ids:
+            key = _normalize_instance_name(str(monitor.InstanceName))
+            device = display_map.get(key)
+            if device is not None:
+                matched_keys.add(key)
+            matched_devices.append(device)
+
+        # 有没匹配上的：用剩余显示设备按枚举顺序补齐（两个枚举通常同序），
+        # 保证每块屏都能拿到 display_name，通知定位 / DDC / 伽马才不会退回主屏
+        unmatched_indices = [index for index, device in enumerate(matched_devices) if device is None]
+        remaining_devices = [device for key, device in display_map.items() if key not in matched_keys]
+        if unmatched_indices and len(unmatched_indices) == len(remaining_devices):
+            for index, device in zip(unmatched_indices, remaining_devices):
+                matched_devices[index] = device
 
         for index, monitor in enumerate(monitor_ids):
             instance_name = str(monitor.InstanceName)
-            key = _normalize_instance_name(instance_name)
-            device = display_map.get(key, {})
-            if not device and order_fallback:
-                device = ordered_devices[index]
+            device = matched_devices[index] or {}
             params = _screen_params(
                 device,
                 wmi_monitor=monitor,

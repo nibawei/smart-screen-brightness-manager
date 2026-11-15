@@ -170,15 +170,20 @@ pyinstaller --onedir --windowed --name Light --icon favicon.ico ^
 | 内置屏（`内置屏` / `LVDS` / `DisplayPort(内置)`） | WMI → DDC/CI → 伽马 |
 
 1. **DDC/CI**：`dxva2.dll` 的 `GetVCPFeatureAndVCPFeatureReply` / `SetVCPFeature(0x10)`。
-   按显示器返回的 VCP 最大值缩放目标值（有的屏不是 0-100），每次写入重试两次并回读；
+   按显示器返回的 VCP 最大值缩放目标值（有的屏不是 0-100），每次写入重试两次，
+   并轮询回读约 0.5 秒（外接屏 DDC 生效常有延迟，读太早会误判成失败）；
    这是 Twinkle Tray、Monitorian 等工具控制外接屏的主要方式。
 2. **WMI**：`WmiMonitorBrightnessMethods`，按 `InstanceName` 精确匹配，找不到时按序号回退。
-   Windows 对外接屏经常「列得出来但写不进去」，所以外接屏不把 WMI 作为首选。
-3. **伽马表软件调光**：`SetDeviceGammaRamp`，DDC/WMI 都不可用时兜底。只能压暗、不能提亮，
-   100% 表示恢复原样；HDR 模式下部分驱动会拒绝。程序退出时会自动把伽马表恢复。
+   Windows 对外接屏经常「列得出来但写不进去」，所以外接屏不把 WMI 作为首选；
+   外接屏的 WMI 如果读不到回读值，按失败处理并继续降级，避免「看起来调了其实没变」。
+3. **伽马表软件调光**：`SetDeviceGammaRamp`，DDC/WMI 都不可用时兜底。按比例压暗
+   （白点也会一起下降，不会出现「设了很低还是很亮」），只能压暗、不能提亮；
+   100% 表示恢复原样，0% 保留约 6% 避免全黑；HDR 模式下部分驱动会拒绝。
+   程序退出时会自动把伽马表恢复。
 
 物理后端写入后会回读校验，偏差超过 2 就判为失败并继续尝试下一个后端；全部失败才报错。
-通知按 `\\.\DISPLAYn` 映射到对应屏幕。
+通知按 `\\.\DISPLAYn` 映射到对应屏幕：调整哪块屏，通知就显示在哪块屏（名称会统一成
+`DISPLAYn` 再比较）；定位失败时退回主屏并写一条日志，便于排查。
 
 ## 屏幕参数档案（含 HDMI 外接屏）
 

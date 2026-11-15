@@ -100,11 +100,20 @@ import devices
 import models
 from config import config_manager, get_user_data_path
 from utils import SystemUtils, ToastNotifier
-from notification import Notification, show_notification, show_startup_notification, show_window_notification, show_cursor_notification, show_all_screens_notification
+from notification import (Notification, get_app, show_notification, show_startup_notification,
+                          show_window_notification, show_cursor_notification, show_all_screens_notification)
 
 # 全局资源变量，确保整个程序运行期间保持打开
 _global_mutex = None
 _instance_lock_file = None
+
+
+def _normalize_display_name(name):
+    """统一显示设备名：`\\.\DISPLAY2` / `DISPLAY2` 视为同一个。"""
+    text = str(name or "").strip().upper()
+    if text.startswith("\\\\.\\"):
+        text = text[4:]
+    return text
 
 class BrightnessManagerApp:
     """亮度管理器应用类"""
@@ -726,8 +735,15 @@ class BrightnessManagerApp:
         return state
 
     def on_screen_change(self, event=None):
-        """切换当前屏幕：把该屏当前亮度读回滑条"""
-        screen = self._active_screen()
+        """切换当前屏幕：按下拉框选中的名字切换，并把该屏当前亮度读回滑条"""
+        selected_name = self.screen_var.get() if hasattr(self, 'screen_var') else ''
+        screen = None
+        for item in self.available_monitors:
+            if item.get('name') == selected_name:
+                screen = item
+                break
+        if screen is None:
+            screen = self._active_screen()
         if not screen:
             return
         self.active_screen_id = screen['id']
@@ -795,16 +811,18 @@ class BrightnessManagerApp:
 
     def _qt_screen_index(self, screen):
         """把 `\\.\DISPLAYn` 映射到 Qt 屏幕序号；映射不到返回 None。"""
-        display_name = str((screen or {}).get('display_name') or '').upper()
-        if not display_name:
+        target = _normalize_display_name((screen or {}).get('display_name'))
+        if not target:
             return None
         try:
             from PyQt5.QtWidgets import QApplication
             app = QApplication.instance()
             if app is None:
+                app = get_app()
+            if app is None:
                 return None
             for index, qt_screen in enumerate(app.screens()):
-                if str(qt_screen.name()).upper() == display_name:
+                if _normalize_display_name(qt_screen.name()) == target:
                     return index
         except Exception:
             return None
@@ -814,6 +832,14 @@ class BrightnessManagerApp:
         """按屏幕定位通知；映射失败退回主屏，绝不把 WMI 序号当 Qt 序号。"""
         index = self._qt_screen_index(screen)
         if index is None:
+            display_name = (screen or {}).get('display_name')
+            if display_name:
+                warned = getattr(self, '_notify_warned', None)
+                if warned is None:
+                    warned = self._notify_warned = set()
+                if display_name not in warned:
+                    warned.add(display_name)
+                    self.log_warning(f"通知定位失败：{display_name} 不在 Qt 屏幕列表里，将显示在主屏")
             show_notification(message, position=self.notification_position, level=level)
         else:
             show_notification(

@@ -128,5 +128,119 @@ class PipelineTest(unittest.TestCase):
         self.assertNotEqual(without_legacy, with_legacy)
 
 
+class ScreenSwitchTest(unittest.TestCase):
+    """下拉框切换屏幕后，应用必须写到新选中的那块屏（而不是主屏）。"""
+
+    class FakeVar:
+        def __init__(self, value=None):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    class FakeLabel:
+        def __init__(self):
+            self.text = ""
+
+        def config(self, **kwargs):
+            self.text = kwargs.get("text", self.text)
+
+    def setUp(self):
+        original = app_module.config_manager
+
+        class DummyConfig:
+            def __init__(self):
+                self.data = {}
+
+            def set(self, key, value):
+                self.data[key] = value
+
+            def get(self, key, default=None):
+                return self.data.get(key, default)
+
+            def save_config(self):
+                pass
+
+        app_module.config_manager = DummyConfig()
+        self.addCleanup(setattr, app_module, "config_manager", original)
+
+    def make(self):
+        obj = object.__new__(app_module.BrightnessManagerApp)
+        obj.available_monitors = [
+            {"id": "scr-a", "name": "Screen A", "display_name": "\\\\.\\DISPLAY1",
+             "supported": True, "current": 50, "params": {}},
+            {"id": "scr-b", "name": "Screen B", "display_name": "\\\\.\\DISPLAY2",
+             "supported": True, "current": 40, "params": {}},
+        ]
+        obj.active_screen_id = "scr-a"
+        obj.screen_states = {}
+        obj.screen_var = self.FakeVar("Screen B")
+        obj.brightness_var = self.FakeVar(0)
+        obj.brightness_label = self.FakeLabel()
+        obj.screen_status_label = self.FakeLabel()
+        obj.log_info = lambda message: None
+        return obj
+
+    def test_switch_updates_active_screen(self):
+        obj = self.make()
+        obj.on_screen_change()
+        self.assertEqual(obj.active_screen_id, "scr-b")
+        self.assertEqual(obj.brightness_var.get(), 40)
+
+    def test_active_screen_after_switch(self):
+        obj = self.make()
+        obj.on_screen_change()
+        self.assertEqual(obj._active_screen()["id"], "scr-b")
+        self.assertEqual(obj._active_screen()["display_name"], "\\\\.\\DISPLAY2")
+
+
+class NotifyRoutingTest(unittest.TestCase):
+    """附屏通知要落到附屏，而不是永远主屏。"""
+
+    @staticmethod
+    def make(qt_index):
+        obj = object.__new__(app_module.BrightnessManagerApp)
+        obj.notification_position = 'bottom'
+        obj._notify_warned = set()
+        obj.log_warning = lambda message: None
+        obj._qt_screen_index = lambda screen: qt_index
+        return obj
+
+    @staticmethod
+    def call(obj, screen):
+        captured = {}
+        original = app_module.show_notification
+
+        def fake(message, **kwargs):
+            captured["message"] = message
+            captured.update(kwargs)
+            return []
+
+        app_module.show_notification = fake
+        try:
+            obj._notify_screen(screen, "亮度已调整为 40%", "success")
+        finally:
+            app_module.show_notification = original
+        return captured
+
+    def test_secondary_screen_notification_uses_custom_index(self):
+        captured = self.call(self.make(1), {"display_name": "\\\\.\\DISPLAY2", "name": "B"})
+        self.assertEqual(captured["message"], "亮度已调整为 40%")
+        self.assertEqual(captured["screen_mode"], "custom")
+        self.assertEqual(captured["screen_index"], 1)
+        self.assertEqual(captured["level"], "success")
+
+    def test_unmapped_screen_falls_back_to_primary(self):
+        captured = self.call(self.make(None), {"display_name": "", "name": "X"})
+        self.assertNotIn("screen_mode", captured)
+
+    def test_display_name_normalization(self):
+        self.assertEqual(app_module._normalize_display_name("\\\\.\\DISPLAY2"), "DISPLAY2")
+        self.assertEqual(app_module._normalize_display_name("display2"), "DISPLAY2")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -511,15 +511,20 @@ def _ddc_set(display_name, value):
                 except Exception as exc:
                     ok = False
                     last_error = str(exc)
-                time.sleep(0.05)
-                readback, _ = _ddc_probe(handle)
-                if ok and readback is not None:
+                if not ok:
+                    last_error = "SetVCPFeature 失败"
+                    time.sleep(0.08)
+                    continue
+                # 有些显示器 DDC 生效有延迟，轮询回读最多 ~0.5s
+                for _ in range(6):
+                    time.sleep(0.08)
+                    readback, _ = _ddc_probe(handle)
+                    if readback is None:
+                        continue
                     percent = int(round(readback / maximum * 100))
                     if abs(percent - target_percent) <= 2:
                         return True, percent, ""
                     last_error = f"回读 {percent}%，与目标 {target_percent}% 不一致"
-                elif not ok:
-                    last_error = "SetVCPFeature 失败"
         return False, None, last_error
     finally:
         _ddc_destroy(handles)
@@ -533,14 +538,19 @@ _GAMMA_APPLIED = {}
 
 
 def _build_gamma_ramp(brightness):
-    """把 0-100 的亮度映射成 3×256 的伽马表（100 = 恒等，0 = 最暗但不是全黑）。"""
+    """把 0-100 的亮度映射成 3×256 的伽马表。
+
+    用**比例压暗**（白点也一起下降），而不是只压中间调的幂函数：
+    后者 255 始终保持满值，用户设了很低亮度仍会觉得「偏亮」。
+    100 = 恒等；0 = 保留 6%（避免全黑、还能操作）。
+    """
     level = max(0.0, min(100.0, float(brightness))) / 100.0
-    gamma = 1.0 + (1.0 - level) * 2.2
+    factor = 0.06 + 0.94 * level
     ramp = (ctypes.c_ushort * 768)()
     for channel in range(3):
         base = channel * 256
         for index in range(256):
-            ramp[base + index] = int(round(65535.0 * (index / 255.0) ** gamma))
+            ramp[base + index] = int(round(65535.0 * (index / 255.0) * factor))
     return ramp
 
 
@@ -552,6 +562,9 @@ def _gamma_set(display_name, brightness):
     """
     if not display_name:
         return False, None, "缺少显示设备名，无法软件调光"
+    # CreateDCW 对无效设备名会静默退回主屏，这里先挡掉，避免把主屏调暗
+    if not str(display_name).upper().startswith("\\\\.\\DISPLAY"):
+        return False, None, f"无效的显示设备名: {display_name}"
     try:
         gdi32 = ctypes.windll.gdi32
         gdi32.CreateDCW.restype = ctypes.wintypes.HDC
@@ -775,6 +788,7 @@ def set_brightness_targets(targets, screens=None, verify=True):
 
         errors = []
         settled = False
+        internal_screen = str((screen.get("params") or {}).get("connection") or "") in _INTERNAL_CONNECTIONS
         for backend in backends:
             display_name = screen.get("display_name", "")
             if backend == "wmi":
@@ -788,8 +802,14 @@ def set_brightness_targets(targets, screens=None, verify=True):
             else:
                 continue
 
-            if ok and verify and backend in ("wmi", "ddc") and current is not None:
-                if abs(current - target) > 2:
+            if ok and verify and backend in ("wmi", "ddc"):
+                if current is None:
+                    # 外接屏的 WMI 经常「调用成功但没有任何效果」，读不到回读值就不能算成功，
+                    # 继续降级到 DDC / 伽马，避免看起来调了、其实屏幕还停在原亮度。
+                    if backend == "wmi" and not internal_screen:
+                        ok = False
+                        error = "WMI 写入无法回读确认，跳过"
+                elif abs(current - target) > 2:
                     ok = False
                     error = f"写入后回读 {current}，与目标 {target} 不一致"
 

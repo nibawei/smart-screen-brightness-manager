@@ -184,6 +184,9 @@ class Notification(QWidget):
             # 确保 QApplication 实例存在
             self.q_app = get_app()
             super().__init__(parent)
+            # position 只接受 top/bottom，其它值（含 None）统一按 top 处理
+            if position not in ('top', 'bottom'):
+                position = 'top'
             self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
             self.setAttribute(Qt.WA_TranslucentBackground)
             
@@ -368,7 +371,7 @@ class Notification(QWidget):
         event.accept()
 
 
-def show_notification(message, position='top', screen_mode='primary', screen_index=None, level='info'):
+def show_notification(message, position='top', screen_mode='primary', screen_index=None, level='info', parent=None):
     """
     便捷的通知显示函数
     
@@ -377,11 +380,13 @@ def show_notification(message, position='top', screen_mode='primary', screen_ind
         position: 通知位置，'top' 或 'bottom'
         screen_mode: 屏幕选择模式
             - 'primary': 主屏幕（默认）
+            - 'widget': 根据父窗口所在屏幕
             - 'cursor': 根据鼠标光标所在屏幕
             - 'all': 所有屏幕
             - 'custom': 使用 screen_index 指定的屏幕
         screen_index: 自定义屏幕索引（仅在 screen_mode='custom' 时使用）
         level: 通知级别，'info'/'success'/'warning'/'error'
+        parent: 父窗口（screen_mode='widget' 时用于定位屏幕）
         
     Returns:
         list: 创建的通知实例列表
@@ -397,7 +402,8 @@ def show_notification(message, position='top', screen_mode='primary', screen_ind
                 position=position,
                 screen_index=idx,
                 screen_mode='custom',
-                level=level
+                level=level,
+                parent=parent
             )
             notifications.append(notif)
     else:
@@ -407,7 +413,8 @@ def show_notification(message, position='top', screen_mode='primary', screen_ind
             position=position,
             screen_index=screen_index,
             screen_mode=screen_mode,
-            level=level
+            level=level,
+            parent=parent
         )
         notifications.append(notif)
     
@@ -425,7 +432,7 @@ def show_startup_notification(message="系统启动", level='info'):
     return show_notification(message, position='top', screen_mode='primary', level=level)
 
 
-def show_window_notification(message, position=None, level='info'):
+def show_window_notification(message, position=None, level='info', parent=None):
     """
     显示窗口操作通知（在窗口所在屏幕上显示）
     
@@ -433,6 +440,7 @@ def show_window_notification(message, position=None, level='info'):
         message: 通知消息
         position: 通知位置，None 则使用默认值 'top'
         level: 通知级别
+        parent: 父窗口（用于定位所在屏幕）
     """
     if position is None:
         position = 'top'
@@ -440,7 +448,8 @@ def show_window_notification(message, position=None, level='info'):
         message, 
         position=position, 
         screen_mode='widget', 
-        level=level
+        level=level,
+        parent=parent
     )
 
 
@@ -467,6 +476,8 @@ def show_all_screens_notification(message, position=None, level='info'):
         position: 通知位置，None 则使用默认值 'top'
         level: 通知级别
     """
+    if position is None:
+        position = 'top'
     return show_notification(message, position=position, screen_mode='all', level=level)
 
 if __name__ == "__main__":
