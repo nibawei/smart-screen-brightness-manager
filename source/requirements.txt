@@ -5,3 +5,4 @@ PyQt5==5.15.11
 pystray==0.19.5
 pywin32==311
 WMI==1.5.1
+comtypes==1.5.0

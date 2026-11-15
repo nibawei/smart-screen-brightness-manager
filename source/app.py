@@ -92,8 +92,13 @@ def is_monitor_on():
     
     return result
 
-from liangdu import BrightnessNeuralNetwork, capture_frames_from_camera, calculate_average_brightness, adjust_brightness, generate_synthetic_data, get_available_cameras, get_available_monitors
-from config import config_manager
+from liangdu import (BrightnessNeuralNetwork, capture_frames_from_camera, calculate_average_brightness,
+                     adjust_brightness, generate_synthetic_data, get_available_cameras, get_available_monitors,
+                     list_brightness_capabilities, set_brightness_targets, restore_gamma_ramps,
+                     TARGET_VERSION)
+import devices
+import models
+from config import config_manager, get_user_data_path
 from utils import SystemUtils, ToastNotifier
 from notification import Notification, show_notification, show_startup_notification, show_window_notification, show_cursor_notification, show_all_screens_notification
 
@@ -125,9 +130,24 @@ class BrightnessManagerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
         
         # 初始化变量
-        self.nn = None  # 神经网络模型
-        self.current_brightness = 50  # 当前亮度值
-        self.brightness_data = []  # 亮度数据缓存
+        self.data_root = get_user_data_path()
+        self.devices_registry_path = os.path.join(self.data_root, 'devices.json')
+        self.legacy_samples_path = os.path.join(self.data_root, 'training_samples.npz')
+        self.devices_registry = devices.load_registry(self.devices_registry_path)
+
+        # 每台摄像头一个相机模型，每块屏幕一条曲线（按需加载并缓存）
+        self.camera_models = {}
+        self.screen_curves = {}
+        # screen_id -> {'brightness', 'participates', 'supported', 'backend', 'manual_set'}
+        self.screen_states = {}
+        self.active_screen_id = None
+        # 最近一次采集：{'features': [...], 'camera_id': ...}
+        self.pending_capture = None
+
+        # 兼容旧字段：nn 指向活动屏幕对应的相机模型
+        self.nn = None
+        self.current_brightness = 50
+        self.brightness_data = []  # 仅用于日志/调试
         self.auto_brightness_enabled = config_manager.get('auto_brightness', True)  # 自动亮度调整开关，默认开启
         self.check_interval = config_manager.get('check_interval', 300)  # 循环检查间隔（秒）
         # 获取实际的开机自启动状态
@@ -138,12 +158,6 @@ class BrightnessManagerApp:
         # 摄像头和显示器选择相关变量
         self.available_cameras = []  # 可用摄像头列表
         self.available_monitors = []  # 可用显示器列表
-        self.selected_camera_index = 0  # 选中的摄像头索引
-        self.selected_monitor_indices = [0]  # 选中的显示器索引列表
-        
-        # 记录上次可用的显示器名称列表，用于热插拔检测
-        self.last_monitor_names = []
-        self.last_camera_names = []
         
         # 热插拔防抖：记录上次刷新时间，避免频繁刷新
         self.last_hotplug_refresh_time = 0
@@ -166,6 +180,7 @@ class BrightnessManagerApp:
         # 线程安全锁
         self.nn_lock = threading.Lock()  # 神经网络模型访问锁
         self.data_lock = threading.Lock()  # 亮度数据访问锁
+        self.training_lock = threading.Lock()  # 同一时间只允许一个训练任务
         self.camera_lock = threading.Lock()  # 摄像头列表访问锁
         self.monitor_lock = threading.Lock()  # 显示器列表访问锁
         self.status_lock = threading.Lock()  # 状态标志访问锁
@@ -209,6 +224,24 @@ class BrightnessManagerApp:
         brightness_frame = ttk.LabelFrame(main_frame, text="亮度控制", padding="10")
         brightness_frame.pack(fill=tk.X, pady=5)
         
+        # 当前屏幕选择（手动调节只作用于这一块屏）
+        screen_row = ttk.Frame(brightness_frame)
+        screen_row.pack(fill=tk.X, pady=2)
+        ttk.Label(screen_row, text="当前屏幕:").pack(side=tk.LEFT, padx=5)
+        self.screen_var = tk.StringVar()
+        self.screen_combo = ttk.Combobox(
+            screen_row,
+            textvariable=self.screen_var,
+            state="readonly",
+            width=32
+        )
+        self.screen_combo.pack(side=tk.LEFT, padx=5)
+        self.screen_combo.bind("<<ComboboxSelected>>", self.on_screen_change)
+        
+        # 当前屏幕的支持状态（WMI / DDC / 不支持）
+        self.screen_status_label = ttk.Label(brightness_frame, text="", foreground="gray")
+        self.screen_status_label.pack(anchor=tk.W, padx=5)
+        
         # 创建亮度滑动条
         self.brightness_var = tk.IntVar(value=self.current_brightness)
         brightness_scale = ttk.Scale(
@@ -233,13 +266,17 @@ class BrightnessManagerApp:
         get_brightness_button = ttk.Button(button_frame, text="获取亮度", command=self.on_get_brightness_click)
         get_brightness_button.pack(side=tk.LEFT, padx=5)
 
-        # 创建应用按钮
+        # 创建应用按钮（只写当前屏，不生成样本）
         apply_button = ttk.Button(button_frame, text="应用", command=self.apply_brightness)
         apply_button.pack(side=tk.LEFT, padx=5)
 
-        # 创建训练按钮
-        train_button = ttk.Button(button_frame, text="训练", command=self.train_network)
-        train_button.pack(side=tk.LEFT, padx=5)
+        # 训练当前屏：记当前屏一条样本并拟合它的曲线
+        train_current_button = ttk.Button(button_frame, text="训练当前屏", command=self.train_current_screen)
+        train_current_button.pack(side=tk.LEFT, padx=5)
+
+        # 训练全部勾选屏：每块参与自动调节的屏各记一条，再拟合
+        train_all_button = ttk.Button(button_frame, text="训练全部勾选屏", command=self.train_all_screens)
+        train_all_button.pack(side=tk.LEFT, padx=5)
         
         # 创建模型加载状态标签
         self.model_status_label = ttk.Label(
@@ -396,6 +433,56 @@ class BrightnessManagerApp:
         notification_position_combo.bind("<<ComboboxSelected>>", self.on_notification_position_change)
         # 测试通知位置
         show_notification("通知将在此处展示", position=self.notification_position, level='info')
+        
+        # 已登记设备信息（摄像头 / 屏幕 / 是否训练过）
+        device_info_frame = ttk.LabelFrame(main_frame, text="已登记设备", padding="10")
+        device_info_frame.pack(fill=tk.BOTH, expand=False, pady=5)
+        self.device_info_text = tk.Text(
+            device_info_frame,
+            height=6,
+            wrap=tk.WORD,
+            font=("Microsoft YaHei", 10)
+        )
+        self.device_info_text.pack(fill=tk.BOTH, expand=True)
+        self.device_info_text.config(state=tk.DISABLED)
+        self._refresh_device_info()
+    
+    def _refresh_device_info(self):
+        """把 devices.json 里的登记情况显示到界面"""
+        if not hasattr(self, 'device_info_text'):
+            return
+        lines = []
+        cameras = self.devices_registry.get('cameras', {})
+        screens = self.devices_registry.get('screens', {})
+        for camera_id, entry in cameras.items():
+            trained = '是' if entry.get('trained') else '否'
+            connected = '' if entry.get('connected', True) else '（未接入）'
+            lines.append(
+                f"摄像头  {entry.get('name', '?')}{connected}  "
+                f"训练:{trained}  样本:{entry.get('sample_count', 0)}  [{camera_id}]"
+            )
+        for screen_id, entry in screens.items():
+            trained = '是' if entry.get('trained') else '否'
+            connected = '' if entry.get('connected', True) else '（未接入）'
+            params = entry.get('params') or {}
+            detail = []
+            if params.get('connection'):
+                detail.append(str(params['connection']))
+            if params.get('resolution'):
+                detail.append(str(params['resolution']))
+            if params.get('size_cm'):
+                detail.append(f"{params['size_cm']}cm")
+            detail_text = ('  ' + ' '.join(detail)) if detail else ''
+            lines.append(
+                f"屏幕    {entry.get('name', '?')}{connected}{detail_text}  "
+                f"训练:{trained}  样本:{entry.get('sample_count', 0)}  [{screen_id}]"
+            )
+        if not lines:
+            lines = ["（尚未登记设备）"]
+        self.device_info_text.config(state=tk.NORMAL)
+        self.device_info_text.delete('1.0', tk.END)
+        self.device_info_text.insert(tk.END, "\n".join(lines))
+        self.device_info_text.config(state=tk.DISABLED)
     def on_notification_position_change(self, event):
         """处理通知位置选择变化"""
         selected_text = self.notification_position_var.get()
@@ -406,92 +493,115 @@ class BrightnessManagerApp:
         config_manager.save_config()
         self.log_info(f"通知位置已更改为：{selected_text}")
     
+    # ------------------------------------------------------------------
+    # 设备与模型
+    # ------------------------------------------------------------------
+
     def init_neural_network_async(self):
-        """在后台线程中异步初始化神经网络"""
+        """在后台线程中加载当前摄像头的模型"""
         self.model_loading = True
         self.log_info("正在后台加载神经网络模型...")
-        
-        # 在后台线程中加载模型
         threading.Thread(target=self._load_model_in_background, daemon=True).start()
-    
-    def _load_model_in_background(self):
-        """在后台线程中加载模型"""
+
+    def _prior_model_paths(self):
+        """打包/用户目录里可用的相机先验模型路径"""
+        model_path = config_manager.get('model_path', 'brightness_model.npz')
+        return [
+            os.path.join(self.data_root, model_path),
+            os.path.join(get_executable_path(), model_path),
+            get_resource_path(model_path),
+        ]
+
+    def get_camera_model(self, camera_id):
+        """取得（必要时创建并落盘）某台摄像头的模型"""
+        camera_id = camera_id or 'cam-default'
+        with self.nn_lock:
+            model = self.camera_models.get(camera_id)
+            if model is not None:
+                self.nn = model
+                return model
+            model_path = os.path.join(self.data_root, 'cameras', f'{camera_id}.npz')
+            model, source = models.load_camera_model_from([model_path] + self._prior_model_paths())
+            if model is None:
+                self.log_info(f"摄像头 {camera_id} 没有可用模型，按合成先验新建")
+                model = models.new_camera_model()
+            elif os.path.abspath(source) != os.path.abspath(model_path):
+                self.log_info(f"摄像头 {camera_id} 首次使用，已从先验复制一份独立模型")
+            try:
+                models.save_camera_model(model_path, model)
+            except Exception as e:
+                self.log_warning(f"保存相机模型失败: {e}")
+            self.camera_models[camera_id] = model
+            self.nn = model
+            return model
+
+    def save_camera_model(self, camera_id):
+        model = self.camera_models.get(camera_id)
+        if model is None:
+            return
         try:
-            executable_path = get_executable_path()
-            model_path = config_manager.get('model_path', 'brightness_model.npz')
-            
-            # 优先从用户数据目录查找模型
-            from config import get_user_data_path
-            user_data_path = get_user_data_path()
-            user_model_path = os.path.join(user_data_path, model_path)
-            exe_model_path = os.path.join(executable_path, model_path)
-            
-            # 确定模型路径优先级：用户数据目录 > exe目录
-            if os.path.exists(user_model_path):
-                model_full_path = user_model_path
-            elif os.path.exists(exe_model_path):
-                model_full_path = exe_model_path
-            else:
-                # 都不存在，使用用户数据目录
-                model_full_path = user_model_path
-            
-            # 尝试加载已保存的模型
-            if os.path.exists(model_full_path):
-                self.nn = BrightnessNeuralNetwork()
-                self.nn.load_model(model_full_path)
-                # 检查模型输入大小是否与当前需要的14维特征匹配
-                if self.nn.input_size != 14:
-                    self.log_info(f"加载的模型输入大小为{self.nn.input_size}，与当前需要的14维特征不匹配，将重新创建模型")
-                    # 创建新模型
-                    self.nn = BrightnessNeuralNetwork()
-                    # 预训练模型
-                    self.pretrain_network()
-                    # 保存模型到用户数据目录
-                    self.nn.save_model(user_model_path)
-                    self.log_info("已创建并预训练神经网络模型")
-                else:
-                    self.log_info("已加载神经网络模型")
-            else:
-                # 如果模型不存在，创建新模型
-                self.nn = BrightnessNeuralNetwork()
-                # 预训练模型
-                self.pretrain_network()
-                # 保存模型到用户数据目录
-                os.makedirs(os.path.dirname(user_model_path), exist_ok=True)
-                self.nn.save_model(user_model_path)
-                self.log_info("已创建并预训练神经网络模型")
-            
-            # 模型加载完成
+            models.save_camera_model(os.path.join(self.data_root, 'cameras', f'{camera_id}.npz'), model)
+        except Exception as e:
+            self.log_warning(f"保存相机模型失败: {e}")
+
+    def get_screen_curve(self, screen_id):
+        """取得（必要时创建）某块屏幕的曲线"""
+        if screen_id not in self.screen_curves:
+            path = os.path.join(self.data_root, 'screens', f'{screen_id}.json')
+            self.screen_curves[screen_id] = models.load_screen_curve(path)
+        return self.screen_curves[screen_id]
+
+    def save_screen_curve(self, screen_id):
+        curve = self.screen_curves.get(screen_id)
+        if curve is None:
+            return
+        screen = next((item for item in self.available_monitors if item.get('id') == screen_id), None)
+        device = (screen or {}).get('params')
+        try:
+            models.save_screen_curve(
+                os.path.join(self.data_root, 'screens', f'{screen_id}.json'),
+                curve,
+                device=device
+            )
+        except Exception as e:
+            self.log_warning(f"保存屏幕曲线失败: {e}")
+
+    def predict_for_screen(self, camera_id, screen_id, features):
+        """相机模型 → 参考亮度 → 屏幕曲线 → 该屏建议亮度"""
+        model = self.get_camera_model(camera_id)
+        reference = int(model.forward(features))
+        brightness = int(round(float(np.clip(self.get_screen_curve(screen_id).evaluate(reference), 0, 100))))
+        return brightness, reference
+
+    def _load_model_in_background(self):
+        """后台加载当前摄像头的模型（设备列表已在 create_gui 里刷新过）"""
+        try:
+            camera = self._active_camera()
+            if camera:
+                self.get_camera_model(camera.get('camera_id'))
+                self.log_info(f"已加载摄像头模型：{camera.get('name')}")
             self.model_loading = False
             self.model_loaded = True
-            
-            # 在主线程中更新UI和启动定时任务
             self.root.after(0, self._on_model_loaded)
-            
         except Exception as e:
             self.log_error(f"初始化神经网络失败: {e}")
-            # 创建默认模型
-            self.nn = BrightnessNeuralNetwork()
             self.model_loading = False
             self.model_loaded = True
             self.root.after(0, self._on_model_loaded)
-    
+
     def _on_model_loaded(self):
         """模型加载完成后的回调（在主线程中执行）"""
         if self.nn:
             self.log_info("神经网络模型加载完成")
             show_startup_notification("神经网络模型加载完成", level='success')
-            
-            # 更新模型状态标签
             self.model_status_label.config(
                 text="模型状态: 已加载",
                 foreground="green"
             )
+            self._update_screen_status()
         else:
             self.log_error("神经网络模型加载失败")
             show_startup_notification("神经网络模型加载失败，部分功能可能不可用", level='error')
-            
-            # 更新模型状态标签为错误状态
             self.model_status_label.config(
                 text="模型状态: 加载失败",
                 foreground="red"
@@ -501,69 +611,6 @@ class BrightnessManagerApp:
         if self.auto_brightness_enabled and self.nn:
             self.log_info("启动自动亮度调整定时任务")
             self.start_auto_adjust_timer()
-    
-    def init_neural_network(self):
-        """初始化神经网络（同步版本，保留用于兼容）"""
-        executable_path = get_executable_path()
-        model_path = config_manager.get('model_path', 'brightness_model.npz')
-        
-        # 优先从用户数据目录查找模型
-        from config import get_user_data_path
-        user_data_path = get_user_data_path()
-        user_model_path = os.path.join(user_data_path, model_path)
-        exe_model_path = os.path.join(executable_path, model_path)
-        
-        # 确定模型路径优先级：用户数据目录 > exe目录
-        if os.path.exists(user_model_path):
-            model_full_path = user_model_path
-        elif os.path.exists(exe_model_path):
-            model_full_path = exe_model_path
-        else:
-            # 都不存在，使用用户数据目录
-            model_full_path = user_model_path
-        
-        try:
-            # 尝试加载已保存的模型
-            if os.path.exists(model_full_path):
-                self.nn = BrightnessNeuralNetwork()
-                self.nn.load_model(model_full_path)
-                # 检查模型输入大小是否与当前需要的14维特征匹配
-                if self.nn.input_size != 14:
-                    self.log_info(f"加载的模型输入大小为{self.nn.input_size}，与当前需要的14维特征不匹配，将重新创建模型")
-                    # 创建新模型
-                    self.nn = BrightnessNeuralNetwork()
-                    # 预训练模型
-                    self.pretrain_network()
-                    # 保存模型到用户数据目录
-                    self.nn.save_model(user_model_path)
-                    self.log_info("已创建并预训练神经网络模型")
-                else:
-                    self.log_info("已加载神经网络模型")
-            else:
-                # 如果模型不存在，创建新模型
-                self.nn = BrightnessNeuralNetwork()
-                # 预训练模型
-                self.pretrain_network()
-                # 保存模型到用户数据目录
-                os.makedirs(os.path.dirname(user_model_path), exist_ok=True)
-                self.nn.save_model(user_model_path)
-                self.log_info("已创建并预训练神经网络模型")
-        except Exception as e:
-            self.log_error(f"初始化神经网络失败: {e}")
-            # 创建默认模型
-            self.nn = BrightnessNeuralNetwork()
-    
-    def pretrain_network(self):
-        """预训练神经网络"""
-        try:
-            # 使用generate_synthetic_data生成训练数据
-            X, y = generate_synthetic_data(num_samples=1000)
-            
-            # 训练模型，传递log_callback参数
-            self.nn.train(X, y, learning_rate=0.001, epochs=1000, batch_size=32, log_callback=self.log_info)
-            self.log_info("神经网络预训练完成")
-        except Exception as e:
-            self.log_error(f"预训练神经网络失败: {e}")
     
     def setup_tray(self):
         """设置系统托盘"""
@@ -639,131 +686,351 @@ class BrightnessManagerApp:
         # 隐藏主窗口到系统托盘
         self.hide_gui()
     
+    # ------------------------------------------------------------------
+    # 亮度应用与训练
+    # ------------------------------------------------------------------
+
+    def _active_camera(self):
+        """当前选中的摄像头（严格匹配，未选择或已断开时返回 None）"""
+        if not self.available_cameras:
+            return None
+        saved_id = config_manager.get('selected_camera_id')
+        selected_name = self.camera_var.get() if hasattr(self, 'camera_var') else ''
+        for camera in self.available_cameras:
+            if saved_id and camera.get('camera_id') == saved_id:
+                return camera
+        for camera in self.available_cameras:
+            if selected_name and camera.get('name') == selected_name:
+                return camera
+        return None
+
+    def _active_screen(self):
+        if not self.available_monitors:
+            return None
+        for screen in self.available_monitors:
+            if screen.get('id') == self.active_screen_id:
+                return screen
+        return self.available_monitors[0]
+
+    def _screen_state(self, screen_id):
+        state = self.screen_states.get(screen_id)
+        if state is None:
+            state = {
+                'brightness': 50,
+                'participates': True,
+                'supported': False,
+                'backend': 'none',
+                'manual_set': False,
+            }
+            self.screen_states[screen_id] = state
+        return state
+
+    def on_screen_change(self, event=None):
+        """切换当前屏幕：把该屏当前亮度读回滑条"""
+        screen = self._active_screen()
+        if not screen:
+            return
+        self.active_screen_id = screen['id']
+        config_manager.set('active_screen_id', self.active_screen_id)
+        state = self._screen_state(screen['id'])
+        if screen.get('current') is not None:
+            state['brightness'] = int(screen['current'])
+        value = int(state.get('brightness', 50))
+        self.brightness_var.set(value)
+        self.brightness_label.config(text=f"亮度: {value}%")
+        self._update_screen_status(screen)
+        self.log_info(f"当前屏幕：{screen.get('name')}")
+
+    def _update_screen_status(self, screen=None):
+        """刷新当前屏幕的后端/支持状态"""
+        if not hasattr(self, 'screen_status_label'):
+            return
+        screen = screen or self._active_screen()
+        if not screen:
+            self.screen_status_label.config(text="未检测到显示器", foreground="red")
+            return
+        state = self._screen_state(screen['id'])
+        if state.get('supported'):
+            backend = str(state.get('backend', 'none')).lower()
+            backend_labels = {'wmi': 'WMI', 'ddc': 'DDC/CI', 'gamma': '软件调光（伽马）'}
+            text = f"调光后端: {backend_labels.get(backend, backend.upper())}    当前: {state.get('brightness', 0)}%"
+            if backend == 'gamma':
+                text += "（仅能压暗）"
+            self.screen_status_label.config(
+                text=text,
+                foreground="orange" if backend == 'gamma' else "green"
+            )
+        else:
+            self.screen_status_label.config(
+                text="该屏幕不支持调光（WMI / DDC / 软件调光均不可用）",
+                foreground="red"
+            )
+
     def on_brightness_change(self, value):
-        """亮度滑动条变化回调"""
+        """亮度滑条变化回调"""
         brightness = int(float(value))
         self.brightness_label.config(text=f"亮度: {brightness}%")
-    
+        screen = self._active_screen()
+        if screen:
+            self._screen_state(screen['id'])['brightness'] = brightness
+
+    def _apply_to_screen(self, screen, brightness, screens=None, manual=True):
+        """把亮度写到指定屏幕，返回 set_brightness_targets 的单屏结果"""
+        screens = screens or [screen]
+        results = set_brightness_targets({screen['id']: int(brightness)}, screens=screens, verify=True)
+        result = results.get(screen['id'], {})
+        state = self._screen_state(screen['id'])
+        state['supported'] = bool(screen.get('supported'))
+        state['backend'] = result.get('backend') or screen.get('backend', 'none')
+        if result.get('ok'):
+            state['brightness'] = int(brightness)
+            if manual:
+                state['manual_set'] = True
+                self._save_manual_screens()
+        return result
+
+    def _save_manual_screens(self):
+        ids = [sid for sid, state in self.screen_states.items() if state.get('manual_set')]
+        config_manager.set('manual_screen_ids', ids)
+
+    def _qt_screen_index(self, screen):
+        """把 `\\.\DISPLAYn` 映射到 Qt 屏幕序号；映射不到返回 None。"""
+        display_name = str((screen or {}).get('display_name') or '').upper()
+        if not display_name:
+            return None
+        try:
+            from PyQt5.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is None:
+                return None
+            for index, qt_screen in enumerate(app.screens()):
+                if str(qt_screen.name()).upper() == display_name:
+                    return index
+        except Exception:
+            return None
+        return None
+
+    def _notify_screen(self, screen, message, level='info'):
+        """按屏幕定位通知；映射失败退回主屏，绝不把 WMI 序号当 Qt 序号。"""
+        index = self._qt_screen_index(screen)
+        if index is None:
+            show_notification(message, position=self.notification_position, level=level)
+        else:
+            show_notification(
+                message,
+                position=self.notification_position,
+                screen_mode='custom',
+                screen_index=index,
+                level=level
+            )
+
     def apply_brightness(self):
-        """应用亮度设置"""
-        # 检查按钮点击频率
+        """应用当前屏幕的滑条值（只写入，不生成训练样本）"""
         if not self.can_click_button("apply_brightness"):
             show_window_notification("操作过于频繁，请稍后再试", position=self.notification_position, level='warning')
             return
         
-        # 检查模型是否正在加载
         if self.model_loading:
             self.log_info("模型正在加载中，请稍后再试")
             show_window_notification("模型正在加载中，请稍后再试", position=self.notification_position, level='info')
             return
         
-        brightness = self.brightness_var.get()
+        screen = self._active_screen()
+        if not screen:
+            self.log_warning("没有可用的显示器，无法调整亮度")
+            show_window_notification("没有可用的显示器", position=self.notification_position, level='warning')
+            return
+        
+        brightness = int(self.brightness_var.get())
         try:
-            # 检查屏幕是否息屏，如果是则跳过亮度调整
             if not is_monitor_on():
                 self.log_info("屏幕处于息屏状态，跳过手动亮度调整")
                 show_window_notification("屏幕处于息屏状态，亮度调整已跳过", position=self.notification_position, level='warning')
-                return  # 跳出函数，不执行亮度调整
-            
-            # 检查显示器可用性
-            if not self.available_monitors:
-                self.log_warning("没有可用的显示器，无法调整亮度")
-                show_window_notification("没有可用的显示器", position=self.notification_position, level='warning')
                 return
-            
-            # 获取选中的显示器索引列表
-            monitor_indices = self.get_selected_monitor_indices()
-            
-            if not monitor_indices:
-                self.log_warning("没有选中任何显示器，无法调整亮度")
-                show_window_notification("请先选择要调整的显示器", position=self.notification_position, level='warning')
-                return
-            
-            success = adjust_brightness(brightness, monitor_indices)
-            if success:
-                self.log_info(f"亮度已调整为：{brightness}%")
+            result = self._apply_to_screen(screen, brightness)
+            if result.get('ok'):
                 self.current_brightness = brightness
-                # 在所有需要调整的屏幕上显示通知
-                for idx in monitor_indices:
-                    show_notification(f"亮度已调整为 {brightness}%", position=self.notification_position, screen_mode='custom', screen_index=idx, level='success')
+                self.log_info(f"{screen.get('name')} 亮度已调整为 {brightness}%")
+                self._update_screen_status(screen)
+                self._notify_screen(screen, f"亮度已调整为 {brightness}%", 'success')
             else:
-                error_msg = "调整亮度失败，显示器可能不支持亮度调节"
-                self.log_error(error_msg)
-                # 在所有需要调整的屏幕上显示错误通知
-                for idx in monitor_indices:
-                    show_notification(error_msg, position=self.notification_position, screen_mode='custom', screen_index=idx, level='error')
+                error_msg = result.get('error') or "调整亮度失败，显示器可能不支持亮度调节"
+                self.log_error(f"{screen.get('name')} 调整失败：{error_msg}")
+                self._notify_screen(screen, error_msg, 'error')
         except Exception as e:
             error_msg = f"调整亮度时出错：{e}"
             self.log_error(error_msg)
-            # 显示错误通知
             show_window_notification(error_msg, position=self.notification_position, level='error')
-    
-    def train_network(self):
-        """训练神经网络"""
-        # 检查按钮点击频率
+
+    def _pending_features(self, camera):
+        """最近一次采集的特征是否可用于当前摄像头（5 分钟内有效）"""
+        pending = self.pending_capture
+        if not pending:
+            return None
+        if pending.get('camera_id') != camera.get('camera_id'):
+            return None
+        if time.time() - pending.get('timestamp', 0) > 300:
+            return None
+        return pending.get('features')
+
+    def _capture_features(self, camera):
+        """抓一帧并提取特征；失败时返回 None 并写清原因"""
+        index = self._camera_index(camera)
+        if index is None:
+            self.log_error(f"摄像头 {camera.get('name', '?')} 没有可用的打开序号")
+            return None
+        try:
+            frames = capture_frames_from_camera(camera_index=index, num_frames=10)
+        except Exception as e:
+            self.log_error(f"摄像头 {camera.get('name', '?')} 打开失败：{e}")
+            return None
+        if not frames:
+            self.log_error(f"摄像头 {camera.get('name', '?')} 未取到画面（可能被占用、已断开，或不是视频设备）")
+            return None
+        _, features = calculate_average_brightness(frames)
+        return features
+
+    def train_current_screen(self):
+        """记录当前屏一条样本并拟合它的曲线"""
+        self._start_training(fine_tune_camera=False)
+
+    def train_all_screens(self):
+        """为每块「参与自动且手动设过」的屏各记录一条样本，再拟合曲线并微调相机"""
+        self._start_training(fine_tune_camera=True)
+
+    def _start_training(self, fine_tune_camera):
         if not self.can_click_button("train_network"):
             show_window_notification("操作过于频繁，请稍后再试", position=self.notification_position, level='warning')
             return
         
-        # 检查模型是否正在加载
         if self.model_loading:
             self.log_info("模型正在加载中，请稍后再试")
             show_window_notification("模型正在加载中，请稍后再试", position=self.notification_position, level='info')
             return
         
-        if not self.nn:
-            self.log_error("神经网络未初始化")
-            show_window_notification("模型未加载，无法训练", position=self.notification_position, level='error')
+        camera = self._active_camera()
+        if not camera:
+            self.log_error("没有可用的摄像头")
+            show_window_notification("没有可用的摄像头", position=self.notification_position, level='error')
             return
         
-        if not self.brightness_data:
-            self.log_error("没有足够的亮度数据进行训练")
-            show_window_notification("没有亮度数据，请先获取亮度", position=self.notification_position, level='warning')
-            return
+        labels = {}
+        if fine_tune_camera:
+            for screen in self.available_monitors:
+                state = self._screen_state(screen['id'])
+                if state.get('participates') and state.get('manual_set'):
+                    labels[screen['id']] = int(state.get('brightness', 50))
+            if not labels:
+                self.log_warning("没有可记录的屏幕：请先手动设置亮度（应用），再点「训练全部勾选屏」")
+                show_window_notification("没有手动设置过的屏幕，无法训练", position=self.notification_position, level='warning')
+                return
+        else:
+            screen = self._active_screen()
+            if not screen:
+                self.log_warning("没有可用的显示器")
+                return
+            labels[screen['id']] = int(self.brightness_var.get())
         
-        # 检查显示器可用性（训练需要应用亮度）
-        if not self.available_monitors:
-            self.log_warning("没有可用的显示器，无法训练")
-            show_window_notification("没有可用的显示器，无法训练", position=self.notification_position, level='warning')
-            return
-        
-        # 应用当前亮度设置
-        self.apply_brightness()
-        
-        # 开始训练
         self.log_info("开始训练神经网络...")
-        
-        # 在后台线程中训练
-        threading.Thread(target=self.do_train_network, daemon=True).start()
-    
-    def do_train_network(self):
-        """在后台线程中训练神经网络"""
+        if self.training_lock.locked():
+            show_window_notification("正在训练中，请稍候", position=self.notification_position, level='info')
+            return
+        threading.Thread(
+            target=self._train_worker,
+            args=(camera, labels, fine_tune_camera),
+            daemon=True
+        ).start()
+
+    def _train_worker(self, camera, labels, fine_tune_camera):
+        """后台训练：记录样本 → 拟合屏幕曲线 →（可选）微调相机模型"""
+        if not self.training_lock.acquire(blocking=False):
+            self.log_warning("已有训练任务在运行，本次训练跳过")
+            return
         try:
-            # 准备训练数据
-            X = []
-            y = []
+            features = self._pending_features(camera) or self._capture_features(camera)
+            if features is None:
+                self.log_error("无法获取画面，训练取消")
+                return
             
-            # 使用最近的亮度数据作为输入
-            for data in self.brightness_data:
-                X.append(data)
-                y.append(self.current_brightness)  # 使用当前设置的亮度作为目标输出
+            camera_id = camera['camera_id']
+            expected = 0
+            for screen_id, label in labels.items():
+                path = models.sample_path(self.data_root, camera_id, screen_id)
+                samples_X, samples_y = models.append_samples(path, features, label)
+                self._fit_screen(camera_id, screen_id)
+                devices.mark_screen_trained(self.devices_registry, screen_id, len(samples_X))
+                self.log_info(f"屏幕 {screen_id} 已记录样本并更新曲线（共 {len(samples_X)} 条）")
+                expected += 1
             
-            # 训练模型，传递log_callback参数
-            self.nn.train(X, y, learning_rate=0.001, epochs=1000, batch_size=32, log_callback=self.log_info)
+            if not expected:
+                return
             
-            # 保存模型到用户数据目录
-            from config import get_user_data_path
-            executable_path = get_executable_path()
-            model_path = config_manager.get('model_path', 'brightness_model.npz')
-            user_data_path = get_user_data_path()
-            user_model_path = os.path.join(user_data_path, model_path)
+            if fine_tune_camera:
+                self._finetune_camera(camera_id)
             
-            os.makedirs(os.path.dirname(user_model_path), exist_ok=True)
-            self.nn.save_model(user_model_path)
+            devices.mark_camera_trained(self.devices_registry, camera_id)
+            try:
+                devices.save_registry(self.devices_registry_path, self.devices_registry)
+            except Exception as e:
+                self.log_warning(f"保存设备登记失败: {e}")
             
+            self.root.after(0, lambda: self._update_screen_status())
+            self.root.after(0, self._refresh_device_info)
             self.log_info("神经网络训练完成并保存")
         except Exception as e:
             self.log_error(f"训练神经网络失败: {e}")
+        finally:
+            self.training_lock.release()
+
+    def _fit_screen(self, camera_id, screen_id):
+        """用该屏的全部样本（含 legacy）拟合屏幕曲线"""
+        model = self.get_camera_model(camera_id)
+        path = models.sample_path(self.data_root, camera_id, screen_id)
+        features, labels = models.load_samples(path)
+        if not features:
+            return
+        legacy_X, legacy_y = models.legacy_weighted(*models.load_legacy_samples(self.legacy_samples_path))
+        all_features = list(features) + list(legacy_X)
+        all_labels = list(labels) + list(legacy_y)
+        references = [model.forward(item) for item in all_features]
+        curve = self.get_screen_curve(screen_id)
+        curve.fit(references, all_labels, ridge=1.0, sample_count=len(features))
+        self.save_screen_curve(screen_id)
+
+    def _finetune_camera(self, camera_id):
+        """用本摄像头所有屏幕的样本微调相机模型（样本不足时跳过）"""
+        model = self.get_camera_model(camera_id)
+        reference_samples = []
+        total = 0
+        for screen in self.available_monitors:
+            path = models.sample_path(self.data_root, camera_id, screen['id'])
+            features, labels = models.load_samples(path)
+            if not features:
+                continue
+            curve = self.get_screen_curve(screen['id'])
+            references = curve.inverse(np.asarray(labels, dtype=np.float64))
+            reference_samples.extend(zip(features, references.tolist()))
+            total += len(features)
+        
+        if total < 20:
+            self.log_info(f"真实样本仅 {total} 条，跳过相机模型微调（避免过拟合）")
+            return
+        
+        with self.nn_lock:
+            models.finetune_camera_model(
+                model,
+                reference_samples,
+                prior_samples=max(200, total),
+                epochs=300,
+                learning_rate=0.0005
+            )
+        self.save_camera_model(camera_id)
+        self.log_info(f"相机模型已用 {total} 条样本微调")
+        # 相机模型变了，重新拟合各屏曲线
+        for screen in self.available_monitors:
+            path = models.sample_path(self.data_root, camera_id, screen['id'])
+            if models.load_samples(path)[0]:
+                self._fit_screen(camera_id, screen['id'])
     
     def can_click_button(self, button_name):
         """检查按钮是否可以点击（频率限制）
@@ -802,62 +1069,148 @@ class BrightnessManagerApp:
         threading.Thread(target=self.get_brightness_data, daemon=True).start()
 
     def get_brightness_data(self):
-        """获取亮度数据"""
+        """采集一次环境画面，为每块屏计算建议亮度（只更新界面，不写硬件）"""
         self.log_info("正在获取亮度数据...")
         self.root.after(0, lambda: show_window_notification("正在获取亮度...", position=self.notification_position, level='info'))
         try:
-            # 检查设备可用性
-            if not self._check_devices_available():
-                self.root.after(0, lambda: show_window_notification("摄像头不可用，无法获取亮度", position=self.notification_position, level='error'))
+            camera = self._active_camera()
+            if not camera:
+                self.log_error("未选择摄像头或摄像头已断开，无法获取亮度")
+                self.root.after(0, lambda: show_window_notification("未选择摄像头，请先在设置中选择", position=self.notification_position, level='error'))
                 return
             
-            # 获取选中的摄像头索引
-            camera_index = self.get_selected_camera_index()
-            
-            if camera_index is None:
-                self.log_error("无效的摄像头选择")
-                self.root.after(0, lambda: show_window_notification("摄像头不可用，无法获取亮度", position=self.notification_position, level='error'))
+            index = self._camera_index(camera)
+            if index is None:
+                self.log_error(f"摄像头 {camera.get('name', '?')} 没有可用的打开序号")
+                self.root.after(0, lambda: show_window_notification("摄像头配置无效，请刷新后重试", position=self.notification_position, level='error'))
                 return
             
-            # 捕获图像帧，减少帧数以提升性能
-            frames = capture_frames_from_camera(camera_index=camera_index, num_frames=10)
-            
+            frames = capture_frames_from_camera(camera_index=index, num_frames=10)
             if not frames:
-                self.log_error("无法从摄像头捕获图像，可能摄像头被占用或已断开")
-                self.root.after(0, lambda: show_window_notification("无法获取摄像头图像", position=self.notification_position, level='error'))
+                self.log_error(f"摄像头 {camera.get('name', '?')} 未取到画面（可能被占用、已断开或不是视频设备）")
+                self.root.after(0, lambda: show_window_notification("无法获取摄像头图像，请检查连接", position=self.notification_position, level='error'))
                 return
             
-            # 计算当前亮度和其他特征，返回(current_brightness, features)元组
-            current_brightness, features = calculate_average_brightness(frames)
-            
-            # 缓存亮度数据（线程安全）
+            _, features = calculate_average_brightness(frames)
+            self.pending_capture = {
+                'features': features,
+                'camera_id': camera['camera_id'],
+                'timestamp': time.time(),
+            }
             with self.data_lock:
                 self.brightness_data.append(features)
-                # 限制缓存大小，避免内存占用过大
                 if len(self.brightness_data) > 100:
                     self.brightness_data = self.brightness_data[-100:]
             
-            # 使用神经网络预测亮度（线程安全）
-            with self.nn_lock:
-                if self.nn:
-                    predicted_brightness = self.nn.forward(features)
-                    predicted_brightness = int(predicted_brightness)
-                else:
-                    predicted_brightness = None
+            predictions = {}
+            for screen in self.available_monitors:
+                predicted, reference = self.predict_for_screen(camera['camera_id'], screen['id'], features)
+                predictions[screen['id']] = (predicted, reference)
+                self._screen_state(screen['id'])['predicted'] = predicted
+                self.log_info(f"{screen.get('name')}：参考亮度 {reference}% → 建议 {predicted}%")
             
-            if predicted_brightness is not None:
-                # 更新滑动条位置
-                self.brightness_var.set(predicted_brightness)
-                self.brightness_label.config(text=f"亮度: {predicted_brightness}%")
-                
-                self.log_info(f"当前环境亮度: {current_brightness}")
-                self.log_info(f"神经网络推荐亮度: {predicted_brightness}%")
-            else:
-                self.log_error("神经网络未初始化")
-                self.root.after(0, lambda: show_window_notification("模型未加载，无法预测亮度", position=self.notification_position, level='error'))
+            screen = self._active_screen()
+            if screen and screen['id'] in predictions:
+                predicted, reference = predictions[screen['id']]
+                self.current_brightness = predicted
+                self.root.after(0, lambda v=predicted: self._show_predicted(v))
+                self.log_info(f"当前环境亮度（参考）: {reference}")
+                self.log_info(f"神经网络推荐亮度: {predicted}%")
         except Exception as e:
             self.log_error(f"获取亮度数据失败：{e}")
             self.root.after(0, lambda: show_window_notification(f"获取亮度失败：{e}", position=self.notification_position, level='error'))
+    
+    def _show_predicted(self, brightness):
+        """把建议亮度写回滑条（主线程执行）"""
+        self.brightness_var.set(int(brightness))
+        self.brightness_label.config(text=f"亮度: {int(brightness)}%")
+    
+    def auto_adjust_brightness(self):
+        """自动调整：对「勾选参与自动」且支持调光的屏幕逐块写入"""
+        try:
+            if not is_monitor_on():
+                self.log_info("屏幕处于息屏状态，跳过亮度调整")
+                return
+            
+            self.root.after(0, lambda: show_window_notification("正在自动调整亮度...", position=self.notification_position, level='info'))
+            
+            def run_with_timeout():
+                try:
+                    camera = self._active_camera()
+                    if not camera:
+                        self._handle_auto_adjust_failure("未选择摄像头或摄像头已断开，已跳过本次调整")
+                        return
+                    
+                    index = self._camera_index(camera)
+                    if index is None:
+                        self._handle_auto_adjust_failure(f"摄像头 {camera.get('name', '?')} 没有可用的打开序号")
+                        return
+                    
+                    frames = capture_frames_from_camera(camera_index=index, num_frames=10)
+                    if not frames:
+                        self._handle_auto_adjust_failure(
+                            f"摄像头 {camera.get('name', '?')} 未取到画面（可能被占用、已断开或不是视频设备）"
+                        )
+                        return
+                    
+                    _, features = calculate_average_brightness(frames)
+                    self.pending_capture = {
+                        'features': features,
+                        'camera_id': camera['camera_id'],
+                        'timestamp': time.time(),
+                    }
+                    
+                    targets = {}
+                    for screen in self.available_monitors:
+                        state = self._screen_state(screen['id'])
+                        if not state.get('participates'):
+                            continue
+                        if not state.get('supported'):
+                            continue
+                        predicted, _ = self.predict_for_screen(camera['camera_id'], screen['id'], features)
+                        targets[screen['id']] = predicted
+                    
+                    if not targets:
+                        self._handle_auto_adjust_failure("没有参与自动调节且支持调光的屏幕")
+                        return
+                    
+                    results = set_brightness_targets(targets, screens=self.available_monitors, verify=True)
+                    applied = []
+                    for screen in self.available_monitors:
+                        result = results.get(screen['id'])
+                        if not result:
+                            continue
+                        if result.get('ok'):
+                            self._screen_state(screen['id'])['brightness'] = targets[screen['id']]
+                            applied.append((screen, targets[screen['id']]))
+                        else:
+                            self.log_warning(f"{screen.get('name')} 自动调整失败：{result.get('error')}")
+                    
+                    if applied:
+                        for screen, value in applied:
+                            self.root.after(0, lambda s=screen, v=value: self._notify_screen(
+                                s, f"亮度已自动调整为 {v}%", 'success'
+                            ))
+                        names = ', '.join(f"{s.get('name')}={v}%" for s, v in applied)
+                        self.log_info(f"自动调整完成：{names}")
+                        self.root.after(0, lambda: self._update_screen_status())
+                    else:
+                        self._handle_auto_adjust_failure("自动调整亮度失败，显示器可能不支持亮度调节")
+                except Exception as e:
+                    self._handle_auto_adjust_failure(f"自动调整亮度线程执行出错: {e}")
+            
+            thread = threading.Thread(target=run_with_timeout, daemon=True)
+            thread.start()
+            thread.join(timeout=30)
+            
+            if thread.is_alive():
+                error_msg = "自动调整亮度线程超时"
+                self.log_error(error_msg)
+                self.root.after(0, lambda: show_window_notification(error_msg, position=self.notification_position, level='error'))
+        except Exception as e:
+            error_msg = f"自动调整亮度时出错：{e}"
+            self.log_error(error_msg)
+            self.root.after(0, lambda: show_window_notification(error_msg, position=self.notification_position, level='error'))
     
     def toggle_auto_brightness(self):
         """切换自动亮度调整"""
@@ -866,11 +1219,9 @@ class BrightnessManagerApp:
         
         if self.auto_brightness_enabled:
             self.log_info("已启用自动亮度调整")
-            # 启动自动调整定时任务
             self.start_auto_adjust_timer()
         else:
             self.log_info("已禁用自动亮度调整")
-            # 停止自动调整定时任务
             self.stop_auto_adjust_timer()
     
     def start_auto_adjust_timer(self):
@@ -888,11 +1239,9 @@ class BrightnessManagerApp:
                     # 重新启动定时任务
                     self.start_auto_adjust_timer()
             
-            # 创建并启动线程
             thread = threading.Thread(target=run_adjust, daemon=True)
             thread.start()
         
-        # 使用配置的间隔执行
         self.auto_adjust_timer = threading.Timer(self.check_interval, auto_adjust)
         self.auto_adjust_timer.daemon = True
         self.auto_adjust_timer.start()
@@ -902,107 +1251,6 @@ class BrightnessManagerApp:
         if self.auto_adjust_timer:
             self.auto_adjust_timer.cancel()
             self.auto_adjust_timer = None
-    
-    def auto_adjust_brightness(self):
-        """自动调整亮度"""
-        try:
-            # 检查屏幕是否息屏，如果是则跳过亮度调整
-            if not is_monitor_on():
-                self.log_info("屏幕处于息屏状态，跳过亮度调整")
-                return  # 跳出函数，不执行后续的亮度调整
-            
-            # 检查设备可用性
-            if not self._check_devices_available():
-                return
-            
-            # 显示调整开始通知 - 在主线程执行
-            self.root.after(0, lambda: show_window_notification("正在自动调整亮度...", position=self.notification_position, level='info'))
-            # 设置超时机制，避免长时间阻塞
-            def run_with_timeout():
-                try:
-                    # 获取选中的摄像头索引
-                    camera_index = self.get_selected_camera_index()
-                    
-                    # 验证摄像头索引有效性
-                    if camera_index is None:
-                        self._handle_auto_adjust_failure("摄像头不可用，已跳过本次调整")
-                        return
-                    
-                    # 获取亮度数据，减少帧数以提升性能
-                    frames = capture_frames_from_camera(camera_index=camera_index, num_frames=10)
-                    
-                    if not frames:
-                        self._handle_auto_adjust_failure("无法从摄像头获取图像，可能摄像头被占用或已断开")
-                        return
-                    
-                    # 计算当前亮度和其他特征，返回(current_brightness, features)元组
-                    current_brightness, features = calculate_average_brightness(frames)
-                    
-                    # 缓存亮度数据（线程安全）
-                    with self.data_lock:
-                        self.brightness_data.append(features)
-                        # 限制缓存大小
-                        if len(self.brightness_data) > 100:
-                            self.brightness_data = self.brightness_data[-100:]
-                    
-                    # 使用神经网络预测亮度（线程安全）
-                    with self.nn_lock:
-                        if not self.nn:
-                            self._handle_auto_adjust_failure("神经网络模型未加载，无法预测亮度")
-                            return
-                        predicted_brightness = self.nn.forward(features)
-                        predicted_brightness = int(predicted_brightness)
-                    
-                    # 获取选中的显示器索引列表（线程安全）
-                    with self.monitor_lock:
-                        monitor_indices = self.get_selected_monitor_indices()
-                    
-                    if not monitor_indices:
-                        self._handle_auto_adjust_failure("没有可用的显示器，已跳过亮度调整")
-                        return
-                    
-                    success = adjust_brightness(predicted_brightness, monitor_indices)
-                    if success:
-                        # 在所有需要调整的屏幕上显示通知
-                        indices_copy = list(monitor_indices)
-                        brightness_val = predicted_brightness
-                        notification_pos = self.notification_position
-                        self.root.after(0, lambda: [
-                            show_notification(
-                                f"亮度已自动调整为 {brightness_val}%", 
-                                position=notification_pos,
-                                screen_mode='custom', 
-                                screen_index=idx, 
-                                level='success'
-                            )
-                            for idx in indices_copy
-                        ])
-                        self.log_info(f"自动调整亮度为：{predicted_brightness}%")
-                    else:
-                        self._handle_auto_adjust_failure("自动调整亮度失败，显示器可能不支持亮度调节")
-                except Exception as e:
-                    error_msg = f"自动调整亮度线程执行出错: {e}"
-                    self._handle_auto_adjust_failure(error_msg)
-            
-            # 创建并启动线程
-            thread = threading.Thread(target=run_with_timeout, daemon=True)
-            thread.start()
-            
-            # 等待线程完成，设置超时
-            thread.join(timeout=30)  # 30秒超时
-            
-            if thread.is_alive():
-                error_msg = "自动调整亮度线程超时"
-                self.log_error(error_msg)
-                # 显示错误通知 - 在主线程执行
-                self.root.after(0, lambda: show_window_notification(error_msg, position=self.notification_position, level='error'))
-                
-        except Exception as e:
-            # 忽略错误，确保程序稳定性
-            error_msg = f"自动调整亮度时出错：{e}"
-            self.log_error(error_msg)
-            # 显示错误通知 - 在主线程执行
-            self.root.after(0, lambda: show_window_notification(error_msg, position=self.notification_position, level='error'))
     
     def _check_devices_available(self):
         """检查设备（摄像头和显示器）是否可用
@@ -1069,40 +1317,63 @@ class BrightnessManagerApp:
                     self.start_auto_adjust_timer()
                 break
     
-    def refresh_camera_list(self, restore_selection=True, force_refresh=False):
-        """刷新摄像头列表
-        
-        Args:
-            restore_selection: 是否恢复上次选择的摄像头
-            force_refresh: 是否强制刷新摄像头列表
-        """
+    # ------------------------------------------------------------------
+    # 设备刷新与选择
+    # ------------------------------------------------------------------
+
+    def _register_devices(self):
+        """把当前设备列表合并进 devices.json"""
         try:
-            # 获取可用的摄像头列表
+            self.devices_registry = devices.register(
+                self.devices_registry, self.available_cameras, self.available_monitors
+            )
+            devices.save_registry(self.devices_registry_path, self.devices_registry)
+        except Exception as e:
+            self.log_warning(f"保存设备登记失败: {e}")
+        self._refresh_device_info()
+
+    def refresh_camera_list(self, restore_selection=True, force_refresh=False):
+        """刷新摄像头列表（按 camera_id 恢复选择）"""
+        try:
             self.available_cameras = get_available_cameras(force_refresh=force_refresh)
-            
-            # 更新下拉框选项
-            camera_names = [cam['name'] for cam in self.available_cameras]
+            camera_names = [camera['name'] for camera in self.available_cameras]
             self.camera_combo['values'] = camera_names
             
-            # 设置选中项
-            if camera_names:
-                if restore_selection:
-                    # 尝试恢复上次选择的摄像头
-                    saved_camera_name = config_manager.get('selected_camera_name')
-                    if saved_camera_name and saved_camera_name in camera_names:
-                        self.camera_var.set(saved_camera_name)
-                        self.log_info(f"已恢复上次选择的摄像头: {saved_camera_name}")
-                    else:
-                        # 保存的设备不存在或无记录，使用第一个
-                        self.camera_var.set(camera_names[0])
-                        if saved_camera_name:
-                            self.log_warning(f"保存的摄像头 '{saved_camera_name}' 不可用，已使用默认摄像头")
-                else:
-                    self.camera_var.set(camera_names[0])
+            saved_id = config_manager.get('selected_camera_id')
+            saved_name = config_manager.get('selected_camera_name')
+            if restore_selection:
+                chosen = devices.choose_default_camera(self.available_cameras, saved_id, saved_name)
+            else:
+                chosen = devices.choose_default_camera(self.available_cameras)
             
+            if chosen:
+                self.camera_var.set(chosen['name'])
+                config_manager.set('selected_camera_id', chosen['camera_id'])
+                config_manager.set('selected_camera_name', chosen['name'])
+                if devices.is_virtual_camera(chosen):
+                    self.log_warning(
+                        f"当前选择的是虚拟摄像头（{chosen['name']}），画面可能来自手机投屏，"
+                        "建议在设置中改用物理摄像头"
+                    )
+            else:
+                # 保守策略：保存的摄像头不在线时不自动切到别的设备（尤其不能悄悄切到手机虚拟摄像头）
+                self.camera_var.set('')
+                config_manager.set('selected_camera_id', None)
+                if camera_names:
+                    self.log_warning("上次使用的摄像头未接入，已暂停自动调节；请在设置中重新选择摄像头")
+                    self.root.after(1000, lambda: show_window_notification(
+                        "上次使用的摄像头未接入，请重新选择摄像头",
+                        position=self.notification_position,
+                        level='warning'
+                    ))
+                else:
+                    self.log_warning("没有检测到可用的摄像头")
+            
+            self._register_devices()
             self.log_info(f"已刷新摄像头列表，找到 {len(self.available_cameras)} 个摄像头")
         except Exception as e:
             self.log_error(f"刷新摄像头列表失败：{e}")
+            self.camera_var.set('')
     
     def on_refresh_cameras(self):
         """手动刷新摄像头列表"""
@@ -1114,65 +1385,84 @@ class BrightnessManagerApp:
         self.refresh_camera_list(force_refresh=True)
         show_window_notification("摄像头列表已刷新", position=self.notification_position, level='success')
     
-    def refresh_monitor_list(self, restore_selection=True, force_refresh=False):
-        """刷新显示器列表
+    def _rebuild_monitor_checkboxes(self):
+        """重建「参与自动调节」复选框（按 screen_id）"""
+        for widget in self.monitor_checkboxes_frame.winfo_children():
+            widget.destroy()
+        self.monitor_vars = {}
+        for screen in self.available_monitors:
+            state = self._screen_state(screen['id'])
+            var = tk.BooleanVar(value=bool(state.get('participates', True)))
+            self.monitor_vars[screen['id']] = var
+            var.trace_add('write', lambda *args, sid=screen['id']: self.on_monitor_change(sid))
+            text = screen['name']
+            if not screen.get('supported'):
+                text += "（不支持调光）"
+            ttk.Checkbutton(
+                self.monitor_checkboxes_frame,
+                text=text,
+                variable=var
+            ).pack(anchor=tk.W)
+    
+    def _refresh_screen_combo(self):
+        """刷新当前屏幕下拉框，并把该屏亮度同步到滑条"""
+        values = [screen['name'] for screen in self.available_monitors]
+        self.screen_combo['values'] = values
         
-        Args:
-            restore_selection: 是否恢复上次选择的显示器
-            force_refresh: 是否强制刷新显示器列表
-        """
+        if not self.available_monitors:
+            self.active_screen_id = None
+            self.screen_var.set('')
+            return
+        
+        ids = [screen['id'] for screen in self.available_monitors]
+        saved_active = config_manager.get('active_screen_id')
+        if saved_active in ids:
+            self.active_screen_id = saved_active
+        elif self.active_screen_id not in ids:
+            self.active_screen_id = ids[0]
+        
+        screen = self._active_screen()
+        if not screen:
+            return
+        self.screen_var.set(screen['name'])
+        state = self._screen_state(screen['id'])
+        if screen.get('current') is not None and not state.get('manual_set'):
+            state['brightness'] = int(screen['current'])
+        value = int(state.get('brightness', 50))
+        self.brightness_var.set(value)
+        self.brightness_label.config(text=f"亮度: {value}%")
+        self._update_screen_status(screen)
+    
+    def refresh_monitor_list(self, restore_selection=True, force_refresh=False):
+        """刷新显示器列表（WMI 身份 + DDC 回退）"""
         try:
-            # 获取可用的显示器列表
-            self.available_monitors = get_available_monitors(force_refresh=force_refresh)
+            self.available_monitors = list_brightness_capabilities(force_refresh=force_refresh)
             
-            # 清除现有的复选框
-            for widget in self.monitor_checkboxes_frame.winfo_children():
-                widget.destroy()
-            self.monitor_vars.clear()
+            saved_ids = config_manager.get('selected_screen_ids') or []
+            manual_ids = set(config_manager.get('manual_screen_ids') or [])
+            for screen in self.available_monitors:
+                state = self._screen_state(screen['id'])
+                state['supported'] = bool(screen.get('supported'))
+                state['backend'] = screen.get('backend', 'none')
+                if restore_selection and saved_ids:
+                    state['participates'] = screen['id'] in saved_ids
+                else:
+                    state.setdefault('participates', True)
+                if screen['id'] in manual_ids:
+                    state['manual_set'] = True
+                if screen.get('current') is not None and not state.get('manual_set'):
+                    state['brightness'] = int(screen['current'])
             
-            # 获取上次保存的选择
-            saved_monitor_names = []
-            if restore_selection:
-                saved_monitor_names = config_manager.get('selected_monitor_names') or []
-            
-            # 创建新的复选框
-            for monitor in self.available_monitors:
-                # 默认选中所有显示器
-                is_selected = True
-                if restore_selection and saved_monitor_names:
-                    # 如果保存的选择中有这个显示器，恢复选中状态
-                    is_selected = monitor['name'] in saved_monitor_names
-                
-                var = tk.BooleanVar(value=is_selected)
-                self.monitor_vars[monitor['index']] = var
-                
-                # 绑定选择变化事件
-                var.trace_add('write', lambda *args: self.on_monitor_change())
-                
-                cb = ttk.Checkbutton(
-                    self.monitor_checkboxes_frame,
-                    text=monitor['name'],
-                    variable=var
-                )
-                cb.pack(anchor=tk.W)
-            
-            # 检查是否有保存的显示器不可用
-            current_names = [m['name'] for m in self.available_monitors]
-            if restore_selection and saved_monitor_names:
-                missing = [name for name in saved_monitor_names if name not in current_names]
-                if missing:
-                    self.log_warning(f"保存的显示器不可用: {', '.join(missing)}")
-                    # 显示通知提醒用户
-                    self.root.after(1000, lambda: show_window_notification(
-                        "部分显示器已断开连接，已自动调整选择",
-                        position=self.notification_position,
-                        level='warning'
-                    ))
+            self._rebuild_monitor_checkboxes()
+            self._refresh_screen_combo()
+            self._register_devices()
             
             # 记录当前显示器列表用于热插拔检测
-            self.last_monitor_names = current_names
+            self.last_monitor_ids = [screen['id'] for screen in self.available_monitors]
             
-            self.log_info(f"已刷新显示器列表，找到 {len(self.available_monitors)} 个显示器")
+            found = len(self.available_monitors)
+            supported = sum(1 for screen in self.available_monitors if screen.get('supported'))
+            self.log_info(f"已刷新显示器列表：{found} 块屏，{supported} 块支持软件调光")
         except Exception as e:
             self.log_error(f"刷新显示器列表失败：{e}")
     
@@ -1186,172 +1476,141 @@ class BrightnessManagerApp:
         self.refresh_monitor_list(force_refresh=True)
         show_window_notification("显示器列表已刷新", position=self.notification_position, level='success')
     
+    def refresh_devices(self, force_refresh=False):
+        """同时刷新摄像头与显示器"""
+        self.refresh_camera_list(restore_selection=True, force_refresh=force_refresh)
+        self.refresh_monitor_list(restore_selection=True, force_refresh=force_refresh)
+    
     def on_camera_change(self, event):
         """摄像头选择变化回调"""
-        selected_name = self.camera_var.get()
-        config_manager.set('selected_camera_name', selected_name)
-        self.log_info(f"已选择摄像头: {selected_name}")
+        camera = self._active_camera()
+        if not camera:
+            # 下拉框被清空（设备断开）：保持未选择状态，不自动切到其它摄像头
+            config_manager.set('selected_camera_id', None)
+            self.log_warning("未选择摄像头，自动调节已暂停")
+            return
+        config_manager.set('selected_camera_id', camera['camera_id'])
+        config_manager.set('selected_camera_name', camera['name'])
+        self.log_info(f"已选择摄像头: {camera['name']}（{camera['camera_id']}）")
+        if devices.is_virtual_camera(camera):
+            self.log_warning(
+                "这是虚拟摄像头（可能是手机投屏），画面来自另一台设备，环境光测量可能不准确"
+            )
+            show_window_notification(
+                "当前选中的是虚拟摄像头，建议改用物理摄像头",
+                position=self.notification_position,
+                level='warning'
+            )
+        threading.Thread(target=self._switch_camera_model, args=(camera,), daemon=True).start()
     
-    def on_monitor_change(self):
-        """显示器选择变化回调"""
-        selected_names = []
-        for monitor in self.available_monitors:
-            if self.monitor_vars.get(monitor['index'], tk.BooleanVar(value=False)).get():
-                selected_names.append(monitor['name'])
-        config_manager.set('selected_monitor_names', selected_names)
-        self.log_info(f"已选择显示器: {', '.join(selected_names) if selected_names else '无'}")
+    def _camera_index(self, camera):
+        """摄像头在 OpenCV 中的序号；无效时返回 None"""
+        try:
+            return int((camera or {}).get('index'))
+        except (TypeError, ValueError):
+            return None
     
-    def check_device_hotplug(self):
-        """检查设备（摄像头和显示器）是否发生热插拔变化"""
-        # 防抖检查：避免频繁刷新
-        current_time = time.time()
-        if current_time - self.last_hotplug_refresh_time < self.hotplug_debounce_interval:
-            return False
+    def _switch_camera_model(self, camera):
+        """后台加载切换后摄像头的模型"""
+        try:
+            self.get_camera_model(camera['camera_id'])
+            self.log_info(f"已切换到摄像头模型：{camera['name']}")
+            self.root.after(0, lambda: self._update_screen_status())
+        except Exception as e:
+            self.log_error(f"切换摄像头模型失败: {e}")
+    
+    def on_monitor_change(self, screen_id=None):
+        """显示器勾选变化：勾选 = 参与自动调节"""
+        if screen_id is not None:
+            var = self.monitor_vars.get(screen_id)
+            if var is not None:
+                self._screen_state(screen_id)['participates'] = bool(var.get())
         
-        device_changed = False
-        
-        # 已废弃：改为按需检测
-        # 只在需要时（调整亮度或手动刷新）才检测
+        selected_ids = []
+        for sid, var in self.monitor_vars.items():
+            self._screen_state(sid)['participates'] = bool(var.get())
+            if var.get():
+                selected_ids.append(sid)
+        config_manager.set('selected_screen_ids', selected_ids)
+        self.log_info(f"参与自动调节的屏幕：{len(selected_ids)} 块")
     
-    def _handle_selected_camera_unavailable(self, removed_cameras):
-        """处理选中的摄像头不可用的情况"""
-        current_selected = self.camera_var.get()
-        if current_selected in removed_cameras:
-            self.log_warning(f"当前选中的摄像头 '{current_selected}' 已断开，自动切换")
-            # 切换到第一个可用的摄像头
-            if self.available_cameras:
-                new_camera = self.available_cameras[0]['name']
-                self.camera_var.set(new_camera)
-                config_manager.set('selected_camera_name', new_camera)
-                show_window_notification(f"摄像头已断开，已自动切换到：{new_camera}", position=self.notification_position, level='warning')
-            else:
-                # 没有任何可用摄像头
-                self.camera_var.set('')
-                show_window_notification("所有摄像头已断开，无法获取环境亮度", position=self.notification_position, level='error')
-    
-    def _handle_selected_monitors_unavailable(self, removed_monitors):
-        """处理选中的显示器不可用的情况"""
-        # 检查当前选中的显示器是否有断开的
-        selected_names = []
-        for monitor in self.available_monitors:
-            if self.monitor_vars.get(monitor['index'], tk.BooleanVar(value=False)).get():
-                selected_names.append(monitor['name'])
+    def _handle_selected_monitors_unavailable(self, removed_screen_ids):
+        """参与自动调节的屏幕断开时自动重新选择"""
+        remaining = [
+            screen for screen in self.available_monitors
+            if screen['id'] not in removed_screen_ids
+        ]
+        selected = [
+            screen for screen in remaining
+            if self._screen_state(screen['id']).get('participates')
+        ]
+        if selected:
+            return
         
-        # 如果所有选中的显示器都断开了，或者没有选中任何显示器
-        if not selected_names or all(name in removed_monitors for name in selected_names):
-            self.log_warning("当前选中的显示器已断开，自动切换到可用显示器")
-            # 选中所有可用的显示器
-            for monitor in self.available_monitors:
-                if monitor['index'] in self.monitor_vars:
-                    self.monitor_vars[monitor['index']].set(True)
-            
-            # 更新配置
-            new_selected = [m['name'] for m in self.available_monitors]
-            config_manager.set('selected_monitor_names', new_selected)
-            
-            if new_selected:
-                show_window_notification(f"显示器已断开，已自动选择：{', '.join(new_selected)}", position=self.notification_position, level='warning')
-            else:
-                show_window_notification("所有显示器已断开，无法调整亮度", position=self.notification_position, level='error')
+        self.log_warning("参与自动调节的屏幕都已断开，自动选择可用屏幕")
+        for screen in remaining:
+            self._screen_state(screen['id'])['participates'] = True
+            var = self.monitor_vars.get(screen['id'])
+            if var is not None:
+                var.set(True)
+        config_manager.set('selected_screen_ids', [screen['id'] for screen in remaining])
+        if remaining:
+            names = ', '.join(screen['name'] for screen in remaining)
+            show_window_notification(f"显示器已断开，已自动选择：{names}", position=self.notification_position, level='warning')
+        else:
+            show_window_notification("所有显示器已断开，无法调整亮度", position=self.notification_position, level='error')
     
     def start_hotplug_detection(self):
-        """启动热插拔检测定时器"""
-        # 显示器热插拔检测已移除，改为按需检测
-        # 只在需要调整亮度或手动刷新时才检测显示器变化
-        self.last_camera_names = [c['name'] for c in self.available_cameras]
-        self.last_monitor_names = [m['name'] for m in self.available_monitors]
-        
+        """启动热插拔检测（改为按需检测）"""
+        self.last_camera_ids = [camera['camera_id'] for camera in self.available_cameras]
+        self.last_monitor_ids = [screen['id'] for screen in self.available_monitors]
         self.log_info("热插拔检测已禁用（改为按需检测）")
     
     def check_camera_hotplug_if_needed(self):
-        """检查摄像头是否需要热插拔检测（只在需要时检测）
+        """需要时检测摄像头热插拔（断开时不自动切到其它摄像头）"""
+        current_id = config_manager.get('selected_camera_id')
+        current_ids = [camera['camera_id'] for camera in self.available_cameras]
         
-        当选中的摄像头不可用时，才进行热插拔检测
-        """
-        selected_camera = self.camera_var.get()
-        
-        # 如果选中的摄像头不在当前列表中，说明可能需要刷新
-        if selected_camera and self.available_cameras:
-            if selected_camera not in [c['name'] for c in self.available_cameras]:
-                # 选中的摄像头不可用，刷新列表
-                self.log_info("检测到摄像头可能已断开，正在刷新列表...")
-                self.refresh_camera_list(restore_selection=False, force_refresh=True)
-                
-                # 如果刷新后还是没有找到选中的摄像头
-                if selected_camera not in [c['name'] for c in self.available_cameras]:
-                    self.log_warning(f"摄像头 '{selected_camera}' 已断开")
-                    show_window_notification(f"摄像头已断开：{selected_camera}", position=self.notification_position, level='warning')
-                    # 自动切换到第一个可用摄像头
-                    if self.available_cameras:
-                        new_camera = self.available_cameras[0]['name']
-                        self.camera_var.set(new_camera)
-                        config_manager.set('selected_camera_name', new_camera)
-                        show_window_notification(f"已自动切换到：{new_camera}", position=self.notification_position, level='info')
-                    else:
-                        self.camera_var.set('')
-                        show_window_notification("所有摄像头已断开，无法获取环境亮度", position=self.notification_position, level='error')
+        if current_id and current_id not in current_ids:
+            self.log_info("检测到摄像头可能已断开，正在刷新列表...")
+            self.refresh_camera_list(restore_selection=True, force_refresh=True)
         elif not self.available_cameras:
-            # 没有任何摄像头，尝试刷新
             self.refresh_camera_list(restore_selection=False, force_refresh=True)
     
     def check_monitor_hotplug_if_needed(self):
-        """检查显示器是否需要热插拔检测（只在需要时检测）
+        """需要时检测显示器热插拔"""
+        selected_ids = {
+            sid for sid, var in self.monitor_vars.items() if var.get()
+        }
+        current_ids = {screen['id'] for screen in self.available_monitors}
+        missing = selected_ids - current_ids
         
-        当选中的显示器不可用时，才进行热插拔检测
-        """
-        # 获取当前选中的显示器名称
-        selected_names = []
-        for monitor in self.available_monitors:
-            if self.monitor_vars.get(monitor['index'], tk.BooleanVar(value=False)).get():
-                selected_names.append(monitor['name'])
-        
-        # 检查是否有选中的显示器不在当前列表中
-        if selected_names and self.available_monitors:
-            current_monitor_names = [m['name'] for m in self.available_monitors]
-            unavailable_monitors = [name for name in selected_names if name not in current_monitor_names]
-            
-            if unavailable_monitors:
-                # 有显示器不可用，刷新列表
-                self.log_info("检测到显示器可能已断开，正在刷新列表...")
-                self.refresh_monitor_list(restore_selection=True, force_refresh=True)
-                
-                # 通知用户
-                show_window_notification(f"显示器已断开：{', '.join(unavailable_monitors)}", position=self.notification_position, level='warning')
-                
-                # 自动切换到可用的显示器
-                self._handle_selected_monitors_unavailable(unavailable_monitors)
+        if missing:
+            self.log_info("检测到显示器可能已断开，正在刷新列表...")
+            self.refresh_monitor_list(restore_selection=True, force_refresh=True)
+            current_ids = {screen['id'] for screen in self.available_monitors}
+            missing = selected_ids - current_ids
+            if missing:
+                names = ', '.join(sorted(missing))
+                show_window_notification(f"显示器已断开：{names}", position=self.notification_position, level='warning')
+                self._handle_selected_monitors_unavailable(missing)
         elif not self.available_monitors:
-            # 没有任何显示器，尝试刷新
-            self.refresh_monitor_list(restore_selection=False)
+            self.refresh_monitor_list(restore_selection=False, force_refresh=True)
     
     def get_selected_camera_index(self):
-        """获取选中的摄像头索引
-        
-        Returns:
-            int or None: 摄像头索引，如果没有可用摄像头或选中无效则返回 None
-        """
-        selected_name = self.camera_var.get()
-        if not selected_name:
-            return None
-        
-        for cam in self.available_cameras:
-            if cam['name'] == selected_name:
-                return cam['index']
-        
-        return None  # 选中的摄像头不在可用列表中
+        """当前摄像头的 OpenCV 序号（没有可用摄像头时为 None）"""
+        camera = self._active_camera()
+        return camera['index'] if camera else None
     
     def get_selected_monitor_indices(self):
-        """获取选中的显示器索引列表"""
-        selected_indices = []
-        for monitor in self.available_monitors:
-            if self.monitor_vars.get(monitor['index'], tk.BooleanVar(value=False)).get():
-                selected_indices.append(monitor['index'])
-        
-        # 如果没有选中任何显示器，默认使用第一个
-        if not selected_indices and self.available_monitors:
-            selected_indices.append(0)
-        
-        return selected_indices
+        """参与自动调节的屏幕枚举序号（兼容旧接口）"""
+        indices = [
+            screen['index'] for screen in self.available_monitors
+            if self._screen_state(screen['id']).get('participates')
+        ]
+        if not indices and self.available_monitors:
+            indices.append(self.available_monitors[0]['index'])
+        return indices
     
     def log_info(self, message):
         """记录信息"""
@@ -1386,6 +1645,12 @@ class BrightnessManagerApp:
     
     def on_exit(self):
         """退出应用"""
+        # 恢复被软件调光（伽马）改过的屏幕
+        try:
+            restore_gamma_ramps()
+        except Exception as e:
+            print(f"恢复伽马表失败: {e}")
+        
         # 停止自动调整定时任务
         self.stop_auto_adjust_timer()
         

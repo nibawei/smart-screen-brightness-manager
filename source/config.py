@@ -39,6 +39,9 @@ class ConfigManager:
         self.config_filename = config_file
         self.user_config_path = os.path.join(get_user_data_path(), config_file)
         self.exe_config_path = os.path.join(get_executable_path(), config_file)
+        # 打包后的只读资源目录（onefile 为 _MEIPASS，onedir 为 _internal）
+        meipass = getattr(sys, '_MEIPASS', None)
+        self.resource_config_path = os.path.join(meipass, config_file) if meipass else None
         
         # 优先使用用户目录的配置文件
         if os.path.exists(self.user_config_path):
@@ -47,6 +50,9 @@ class ConfigManager:
             # 如果用户目录没有配置，使用exe目录的配置（如果存在）
             if os.path.exists(self.exe_config_path):
                 self.config_file = self.exe_config_path
+            elif self.resource_config_path and os.path.exists(self.resource_config_path):
+                # 打包后自带的默认配置
+                self.config_file = self.resource_config_path
             else:
                 # 都不存在，使用用户目录
                 self.config_file = self.user_config_path
@@ -58,7 +64,11 @@ class ConfigManager:
             'log_level': 'info',  # 日志级别
             'check_interval': 300,  # 循环检查间隔（秒），默认 5 分钟，范围 60 秒到 86400 秒
             'selected_camera_name': None,  # 上次选择的摄像头名称
-            'selected_monitor_names': None,  # 上次选择的显示器名称列表
+            'selected_monitor_names': None,  # 上次选择的显示器名称列表（旧版，按名称）
+            'selected_camera_id': None,  # 上次选择的摄像头 ID（稳定身份）
+            'selected_screen_ids': [],  # 参与自动调节的屏幕 ID 列表
+            'active_screen_id': None,  # 当前手动调节的屏幕 ID
+            'manual_screen_ids': [],  # 用户手动设置过亮度的屏幕 ID 列表
             'notification_position': 'bottom'  # 通知显示位置：'top'（顶部）或 'bottom'（右下）
         }
         self.config = self.load_config()
@@ -94,6 +104,18 @@ class ConfigManager:
                     return config
             except Exception as e:
                 print(f"加载exe配置文件失败: {e}")
+        
+        # 尝试从打包资源目录加载（单文件/onedir 自带默认配置）
+        if self.resource_config_path and os.path.exists(self.resource_config_path):
+            try:
+                with open(self.resource_config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    for key, value in self.default_config.items():
+                        if key not in config:
+                            config[key] = value
+                    return config
+            except Exception as e:
+                print(f"加载内置配置文件失败: {e}")
         
         # 都失败，返回默认配置
         return self.default_config.copy()

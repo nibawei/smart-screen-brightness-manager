@@ -14,9 +14,12 @@ datas = [
 ]
 
 # 配置
+# 注意：本 spec 内的 datas / ['app.py'] 都是相对路径，
+# 请在 source/ 目录下执行：pyinstaller brightness_manager.spec
+# pathex 留空即可（原先写死的 d:\...\trae_projects\light\source 早已失效）。
 a = Analysis(
     ['app.py'],
-    pathex=[r'd:\niwei\Documents\trae_projects\light\source'],
+    pathex=[],
     binaries=[],
     datas=datas,
     hiddenimports=[
@@ -32,6 +35,9 @@ a = Analysis(
         'win32gui', 
         'winerror', 
         'wmi',
+        'comtypes',
+        'comtypes.automation',
+        'comtypes.persist',
         'tkinter',
         'tkinter.ttk',
         'threading',

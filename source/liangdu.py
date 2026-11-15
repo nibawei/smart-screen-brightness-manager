@@ -1,216 +1,95 @@
-import numpy as np
-import cv2
-import wmi
-import pythoncom
+import atexit
+import ctypes
+import ctypes.wintypes
 import time
 
-# 摄像头列表缓存
-_camera_cache = {
-    'cameras': [],
-    'timestamp': 0,
-    'cache_duration': 60  # 缓存 60 秒，减少频繁扫描
-}
+import cv2
+import numpy as np
+import pythoncom
+import wmi
 
-# 显示器列表缓存
-_monitor_cache = {
-    'monitors': [],
-    'timestamp': 0,
-    'cache_duration': 60  # 缓存 60 秒，减少频繁扫描
-}
+import devices
+
+# 目标函数版本：模型文件里记录这个值，版本不一致时应用会重新训练，
+# 避免沿用「屏幕越暗 → 推荐越亮」的旧模型。
+TARGET_VERSION = 2
+
+# 场景模型常量：摄像头读数 = 环境光贡献 + 屏幕发光贡献
+SCENE_FLOOR = 0.04   # 全黑环境下摄像头读数的下限（0-1，线性亮度）
+SCENE_RANGE = 0.82   # 环境光照对读数的增益范围（0-1，线性亮度）
+SCREEN_GLOW_MIN = 0.02   # 屏幕发光对摄像头读数的耦合系数下限
+SCREEN_GLOW_MAX = 0.10   # 上限：屏幕主要照亮环境，不会让整个画面翻倍
+
+
+def ambient_to_target(ambient_level):
+    """环境光照水平（0-1）→ 舒适屏幕亮度（0-100）
+
+    这是唯一的「目标亮度」来源：只与环境光照有关，与屏幕上显示什么内容无关。
+    暗环境下给出偏低的亮度，明亮环境下给出偏高的亮度，中间段近似线性。
+
+    Args:
+        ambient_level: 环境光照水平，0 表示全黑，1 表示很亮
+
+    Returns:
+        float: 0-100 的推荐亮度
+    """
+    ambient_level = np.clip(np.asarray(ambient_level, dtype=np.float64), 0.0, 1.0)
+    return 12.0 + 83.0 / (1.0 + np.exp(-(ambient_level - 0.42) / 0.16))
+
 
 def get_available_cameras(force_refresh=False):
     """获取所有可用的摄像头列表
-    
+
+    身份与名称来自 `devices.enumerate_cameras`（DirectShow DevicePath / FriendlyName），
+    可打开序号来自 OpenCV；两者按顺序合并，因此插拔后仍能认出同一台设备。
+
     Args:
         force_refresh: 是否强制刷新，忽略缓存
-        
+
     Returns:
-        list: 摄像头信息列表，每个元素为字典，包含 'index' 和 'name'
+        list: 每项包含 index / name / camera_id / device_path / resolution / id_source
     """
-    global _camera_cache
-    
-    # 检查缓存是否有效（除非强制刷新）
-    current_time = time.time()
-    if not force_refresh and _camera_cache['cameras']:
-        if current_time - _camera_cache['timestamp'] < _camera_cache['cache_duration']:
-            return _camera_cache['cameras']
-    
-    cameras = []
-    
-    # 方法 1：使用 DirectShow 过滤器枚举摄像头
     try:
-        # 尝试打开索引 0-9 的摄像头
-        for i in range(10):
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                # 尝试获取摄像头名称
-                camera_name = f"摄像头 {i}"
-                try:
-                    # 读取一帧以确认摄像头可用
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
-                        cameras.append({
-                            'index': i,
-                            'name': camera_name
-                        })
-                except:
-                    pass
-                cap.release()
+        return devices.enumerate_cameras(force_refresh=force_refresh)
     except Exception as e:
-        print(f"枚举摄像头时出错：{e}")
-    
-    # 如果 DirectShow 方法失败，使用简单的测试方法
-    if not cameras:
-        try:
-            for i in range(5):
-                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
-                        cameras.append({
-                            'index': i,
-                            'name': f"摄像头 {i}"
-                        })
-                    cap.release()
-        except Exception as e:
-            print(f"备用方法枚举摄像头失败：{e}")
-    
-    # 如果还是没有找到摄像头，至少添加默认摄像头 0
-    if not cameras:
-        cameras.append({
+        print(f"枚举摄像头失败：{e}")
+        return [{
             'index': 0,
-            'name': '默认摄像头'
-        })
-    
-    # 更新缓存
-    _camera_cache['cameras'] = cameras
-    _camera_cache['timestamp'] = current_time
-    
-    return cameras
+            'name': '默认摄像头',
+            'camera_id': 'cam-fp-unknown',
+            'device_path': '',
+            'resolution': '',
+            'id_source': 'placeholder',
+        }]
+
 
 def get_available_monitors(force_refresh=False):
     """获取所有可用的显示器列表
-    
+
+    主键为 WMI `InstanceName`（`devices.enumerate_screens`），另带 `\\.\DISPLAYn`、
+    是否支持软件调光与当前亮度。
+
     Args:
         force_refresh: 是否强制刷新，忽略缓存
-        
+
     Returns:
-        list: 显示器信息列表，每个元素为字典，包含 'index' 和 'name'
+        list: 每项包含 index / id / name / instance_name / display_name / supported / backend / current
     """
-    global _monitor_cache
-    
-    # 检查缓存是否有效（除非强制刷新）
-    current_time = time.time()
-    if not force_refresh and _monitor_cache['monitors']:
-        if current_time - _monitor_cache['timestamp'] < _monitor_cache['cache_duration']:
-            return _monitor_cache['monitors']
-    
-    monitors = []
-    com_initialized = False
-    
     try:
-        # 初始化 COM（WMI 需要）
-        try:
-            pythoncom.CoInitialize()
-            com_initialized = True
-        except pythoncom.com_error:
-            com_initialized = False
-        
-        # 使用 WMI 获取显示器信息
-        wmi_obj = wmi.WMI(namespace='root\\wmi')
-        monitor_configs = wmi_obj.WmiMonitorID()
-        
-        for i, monitor in enumerate(monitor_configs):
-            try:
-                # 获取显示器名称
-                name = "未知显示器"
-                if hasattr(monitor, 'UserFriendlyName') and monitor.UserFriendlyName:
-                    # UserFriendlyName 是一个字节数组，需要转换
-                    try:
-                        name_bytes = monitor.UserFriendlyName
-                        # 过滤掉空字节和无效字符
-                        name_str = ''.join([chr(b) for b in name_bytes if b != 0 and b < 128])
-                        if name_str.strip():
-                            name = name_str.strip()
-                    except (UnicodeDecodeError, TypeError):
-                        pass
-                
-                monitors.append({
-                    'index': i,
-                    'name': f"{name} (显示器 {i+1})"
-                })
-            except Exception as e:
-                print(f"获取显示器 {i} 信息失败：{e}")
-                # 添加一个通用的显示器条目
-                monitors.append({
-                    'index': i,
-                    'name': f'显示器 {i+1}'
-                })
-            
-    except wmi.x_wmi as e:
-        print(f"使用 WMI 获取显示器列表失败：{e}")
-    except pythoncom.com_error as e:
-        print(f"COM 初始化失败：{e}")
+        return devices.enumerate_screens(force_refresh=force_refresh)
     except Exception as e:
-        print(f"使用 WMI 获取显示器列表失败：{e}")
-        # 如果 WMI 方法失败，使用 Windows API 枚举显示器
-        try:
-            import ctypes
-            from ctypes import wintypes
-            
-            # 简单的显示器枚举
-            monitor_count = 0
-            def callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
-                nonlocal monitor_count
-                monitor_count += 1
-                return True
-            
-            user32 = ctypes.windll.user32
-            MONITORENUMPROC = ctypes.WINFUNCTYPE(
-                ctypes.c_bool,
-                ctypes.POINTER(ctypes.c_int),
-                ctypes.POINTER(ctypes.c_int),
-                ctypes.POINTER(ctypes.wintypes.RECT),
-                ctypes.c_void_p
-            )
-            
-            user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(callback), 0)
-            
-            # 添加检测到的显示器
-            for i in range(monitor_count):
-                monitors.append({
-                    'index': i,
-                    'name': f'显示器 {i+1}'
-                })
-        except ImportError as e2:
-            print(f"导入 ctypes 失败：{e2}")
-        except Exception as e2:
-            print(f"备用方法获取显示器列表失败：{e2}")
-            # 如果所有方法都失败，至少添加一个默认显示器
-            monitors.append({
-                'index': 0,
-                'name': '默认显示器'
-            })
-    finally:
-        # 清理 COM（只在成功初始化后清理）
-        if com_initialized:
-            try:
-                pythoncom.CoUninitialize()
-            except pythoncom.com_error:
-                pass
-    
-    # 如果没有找到任何显示器，添加一个默认显示器
-    if not monitors:
-        monitors.append({
+        print(f"枚举显示器失败：{e}")
+        return [{
             'index': 0,
-            'name': '默认显示器'
-        })
-    
-    # 更新缓存
-    _monitor_cache['monitors'] = monitors
-    _monitor_cache['timestamp'] = current_time
-    
-    return monitors
+            'id': 'scr-unknown',
+            'name': '默认显示器',
+            'instance_name': '',
+            'display_name': '',
+            'supported': False,
+            'backend': 'none',
+            'current': None,
+        }]
+
 
 def process_frame(frame):
     """处理每一帧图像的亮度和对比度计算
@@ -361,30 +240,12 @@ def calculate_average_brightness(frames, weights=None, window_size=5):
     avg_clarity = avg_frame_features[10]
     avg_weighted_brightness = avg_frame_features[11]
     
-    # 计算屏幕暗度指标：RGB平均值越低，屏幕越暗，暗度值越高
-    avg_rgb = (avg_r + avg_g + avg_b) / 3
-    screen_darkness = (255 - avg_rgb) / 255  # 0表示极亮，1表示极暗
-    
-    # 屏幕颜色对亮度的影响权重
-    screen_color_weight = 0.15  # 新增：屏幕颜色影响权重为15%
-    
-    # 综合评分计算：为每个指标分配一个权重
-    # 优化后的权重分配，结合更多特征
-    weighted_score = (0.35 * weighted_brightness +      # 加权平均亮度占 35%
-                      0.15 * average_brightness +       # 平均亮度占 15%
-                      0.10 * (1.0 - brightness_std / 255.0) +  # 亮度标准差（越小越好）占 10%
-                      0.05 * (1.0 - min(avg_brightness_change_rate / 255.0, 1.0)) +  # 亮度变化率（越小越好）占 5%
-                      0.10 * moving_average_brightness +   # 移动平均亮度占 10%
-                      0.10 * average_contrast +       # 平均对比度占 10%
-                      0.05 * avg_saturation +         # 色彩饱和度占 5%
-                      0.05 * avg_perceived_brightness +  # 感知亮度占 5%
-                      0.03 * (3.0 - abs(avg_brightness_kurtosis - 3.0)) / 3.0 +  # 亮度分布峰度（越接近正态越好）占 3%
-                      0.02 * (1.0 - abs(avg_brightness_skewness) / 10.0) +  # 亮度分布偏度（越对称越好）占 2%
-                      screen_color_weight * screen_darkness)  # 新增：屏幕暗度影响占 15% - 屏幕越暗，推荐亮度越高
-    
-    # 将综合评分映射到 1-100 的范围
-    normalized_score = np.clip(weighted_score, 0, 255)  # 确保不会超过 255
-    final_brightness = int((normalized_score / 255) * 99 + 1)  # 映射到 1-100 之间
+    # 环境光照估计：把读数还原成线性亮度后，单调映射到环境光照水平。
+    # 屏幕暗度、屏幕 RGB 这类直接反映「屏幕内容亮度」的量不再参与目标计算，
+    # 否则切到深色主题就会把推荐亮度推高，形成「屏幕越暗 → 推荐越亮」的正反馈。
+    luma = np.power(np.clip(avg_weighted_brightness / 255.0, 0.0, 1.0), 2.2)
+    ambient_level = float(np.clip((luma - SCENE_FLOOR) / SCENE_RANGE, 0.0, 1.0))
+    final_brightness = int(round(ambient_to_target(ambient_level)))
     
     # 构建特征向量（包含所有摄像头和屏幕参数，不包含已经计算好的亮度结果）
     features = [
@@ -454,171 +315,526 @@ def capture_frames_from_camera(camera_index=0, num_frames=20):
     
     return frames
 
-def adjust_brightness(target_brightness, monitor_indices=None):
-    """调整 Windows 系统屏幕亮度
-    
-    Args:
-        target_brightness: 目标亮度值（范围0-100）
-        
-        monitor_indices: 要调整亮度的显示器索引列表，默认为None（调整所有显示器）
-        
-    Returns:
-        bool: 操作是否成功
-    """
-    import ctypes
-    import ctypes.wintypes
-    
-    # 确保目标亮度在0-100范围内
-    target_brightness = max(0, min(100, target_brightness))
-    brightness = int(target_brightness)
-    
-    print(f"尝试设置屏幕亮度为: {brightness}%")
-    
+# ---------------------------------------------------------------------------
+# 每屏亮度控制：WMI 优先，DDC/CI 回退
+# ---------------------------------------------------------------------------
+
+VCP_BRIGHTNESS = 0x10
+
+_DXVA2 = {"lib": None, "tried": False, "error": ""}
+
+
+class _PHYSICAL_MONITOR(ctypes.Structure):
+    _fields_ = [
+        ("hPhysicalMonitor", ctypes.wintypes.HANDLE),
+        ("szPhysicalMonitorDescription", ctypes.wintypes.WCHAR * 128),
+    ]
+
+
+class _MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("rcMonitor", ctypes.wintypes.RECT),
+        ("rcWork", ctypes.wintypes.RECT),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("szDevice", ctypes.wintypes.WCHAR * 32),
+    ]
+
+
+_MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_int,
+    ctypes.wintypes.HMONITOR,
+    ctypes.wintypes.HDC,
+    ctypes.POINTER(ctypes.wintypes.RECT),
+    ctypes.c_void_p,
+)
+
+
+def _load_dxva2():
+    """加载 dxva2.dll 并声明签名；DDC/CI 句柄是 64 位，必须设 argtypes 否则会被截断。"""
+    if _DXVA2["tried"]:
+        return _DXVA2["lib"]
+    _DXVA2["tried"] = True
     try:
-        # 方法1: 使用WMI方法 - 适用于大多数Windows系统
-        try:
-            import wmi
-            print("使用WMI方法设置亮度...")
-            
-            # 尝试不同的WMI命名空间
-            namespaces = ['wmi', 'root\\wmi']
-            success = False
-            
-            for namespace in namespaces:
+        lib = ctypes.WinDLL("dxva2.dll")
+        lib.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [
+            ctypes.wintypes.HMONITOR, ctypes.POINTER(ctypes.wintypes.DWORD)
+        ]
+        lib.GetNumberOfPhysicalMonitorsFromHMONITOR.restype = ctypes.wintypes.BOOL
+        lib.GetPhysicalMonitorsFromHMONITOR.argtypes = [
+            ctypes.wintypes.HMONITOR, ctypes.wintypes.DWORD, ctypes.POINTER(_PHYSICAL_MONITOR)
+        ]
+        lib.GetPhysicalMonitorsFromHMONITOR.restype = ctypes.wintypes.BOOL
+        lib.SetVCPFeature.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.BYTE, ctypes.wintypes.DWORD]
+        lib.SetVCPFeature.restype = ctypes.wintypes.BOOL
+        lib.GetVCPFeatureAndVCPFeatureReply.argtypes = [
+            ctypes.wintypes.HANDLE, ctypes.wintypes.BYTE, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.wintypes.DWORD), ctypes.POINTER(ctypes.wintypes.DWORD),
+        ]
+        lib.GetVCPFeatureAndVCPFeatureReply.restype = ctypes.wintypes.BOOL
+        lib.DestroyPhysicalMonitors.argtypes = [ctypes.wintypes.DWORD, ctypes.POINTER(_PHYSICAL_MONITOR)]
+        lib.DestroyPhysicalMonitors.restype = ctypes.wintypes.BOOL
+    except Exception as exc:
+        _DXVA2["error"] = f"dxva2.dll 不可用: {exc}"
+        return None
+    _DXVA2["lib"] = lib
+    return lib
+
+
+def ddc_status():
+    """DDC/CI 是否可用（供诊断脚本/UI 展示）。"""
+    lib = _load_dxva2()
+    return {"available": lib is not None, "error": _DXVA2["error"]}
+
+
+def _display_monitors():
+    """EnumDisplayMonitors → [(hmonitor, '\\\\.\\DISPLAYn')]。"""
+    monitors = []
+    user32 = ctypes.windll.user32
+    user32.GetMonitorInfoW.argtypes = [ctypes.wintypes.HMONITOR, ctypes.POINTER(_MONITORINFOEXW)]
+    user32.GetMonitorInfoW.restype = ctypes.wintypes.BOOL
+    user32.EnumDisplayMonitors.argtypes = [
+        ctypes.wintypes.HDC, ctypes.POINTER(ctypes.wintypes.RECT), _MONITORENUMPROC, ctypes.wintypes.LPARAM
+    ]
+    user32.EnumDisplayMonitors.restype = ctypes.wintypes.BOOL
+
+    def _callback(hmonitor, hdc, rect, data):
+        info = _MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+        if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            monitors.append((hmonitor, info.szDevice))
+        return 1
+
+    user32.EnumDisplayMonitors(None, None, _MONITORENUMPROC(_callback), 0)
+    return monitors
+
+
+def _ddc_handles(display_name):
+    """拿到 `\\.\DISPLAYn` 对应的物理显示器句柄数组；失败返回 None。"""
+    lib = _load_dxva2()
+    if lib is None or not display_name:
+        return None
+    hmonitor = None
+    for handle, device in _display_monitors():
+        if str(device).upper() == str(display_name).upper():
+            hmonitor = handle
+            break
+    if hmonitor is None:
+        return None
+    count = ctypes.wintypes.DWORD()
+    if not lib.GetNumberOfPhysicalMonitorsFromHMONITOR(hmonitor, ctypes.byref(count)) or count.value == 0:
+        return None
+    handles = (_PHYSICAL_MONITOR * count.value)()
+    if not lib.GetPhysicalMonitorsFromHMONITOR(hmonitor, count.value, handles):
+        return None
+    return handles
+
+
+def _ddc_destroy(handles):
+    lib = _DXVA2["lib"]
+    if lib is None or not handles:
+        return
+    try:
+        lib.DestroyPhysicalMonitors(len(handles), handles)
+    except Exception:
+        pass
+
+
+def _ddc_probe(handle):
+    """读 VCP 0x10 的 (current, max)；不支持返回 (None, None)。"""
+    lib = _DXVA2["lib"]
+    current = ctypes.wintypes.DWORD()
+    maximum = ctypes.wintypes.DWORD()
+    try:
+        ok = lib.GetVCPFeatureAndVCPFeatureReply(
+            handle, VCP_BRIGHTNESS, None, ctypes.byref(current), ctypes.byref(maximum)
+        )
+    except Exception:
+        return None, None
+    if not ok:
+        return None, None
+    return int(current.value), (int(maximum.value) or 100)
+
+
+def _ddc_probe_display(display_name):
+    """探测某块屏的 DDC/CI 亮度能力。
+
+    Returns:
+        dict: available / current / max
+    """
+    handles = _ddc_handles(display_name)
+    if not handles:
+        return {"available": False, "current": None, "max": None}
+    try:
+        for monitor in handles:
+            current, maximum = _ddc_probe(monitor.hPhysicalMonitor)
+            if current is not None:
+                return {"available": True, "current": current, "max": maximum}
+        return {"available": False, "current": None, "max": None}
+    finally:
+        _ddc_destroy(handles)
+
+
+def _ddc_read(display_name):
+    return _ddc_probe_display(display_name).get("current")
+
+
+def _ddc_read_max(display_name):
+    return _ddc_probe_display(display_name).get("max")
+
+
+def _ddc_set(display_name, value):
+    """写 DDC/CI 亮度（按 VCP 最大值缩放），带重试与回读。
+
+    一些外接屏（HDMI/DP）第一次写会失败或需要一点时间生效，所以每块物理屏最多试两次；
+    回读与目标差 >2% 视为没写进去，继续尝试。
+
+    Returns:
+        tuple: (ok, 回读百分比, 错误信息)
+    """
+    handles = _ddc_handles(display_name)
+    if not handles:
+        return False, None, "未找到 DDC/CI 物理显示器"
+    lib = _DXVA2["lib"]
+    target_percent = max(0, min(100, int(round(float(value)))))
+    last_error = "SetVCPFeature 失败"
+    try:
+        for monitor in handles:
+            handle = monitor.hPhysicalMonitor
+            current, maximum = _ddc_probe(handle)
+            if current is None:
+                continue
+            raw_target = int(round(target_percent / 100.0 * maximum))
+            for _ in range(2):
                 try:
-                    w = wmi.WMI(namespace=namespace)
-                    monitors = w.WmiMonitorBrightnessMethods()
-                    
-                    if monitors:
-                        print(f"在命名空间 {namespace} 中找到 {len(monitors)} 个显示器")
-                        for i, monitor in enumerate(monitors):
-                            # 如果指定了显示器索引列表，只调整指定的显示器
-                            if monitor_indices is not None and i not in monitor_indices:
-                                print(f"跳过显示器 {i}（不在选择列表中）")
-                                continue
-                            
-                            try:
-                                print(f"正在设置显示器 {i} 的亮度...")
-                                # 尝试不同的超时值
-                                for timeout in [0, 1000, 5000]:
-                                    try:
-                                        monitor.WmiSetBrightness(brightness, timeout)
-                                        print(f"显示器 {i} 亮度设置成功")
-                                        success = True
-                                        break
-                                    except wmi.x_wmi as e:
-                                        print(f"使用超时 {timeout} 设置亮度失败: {str(e)}")
-                                    except pythoncom.com_error as e:
-                                        print(f"COM错误，使用超时 {timeout} 设置亮度失败: {str(e)}")
-                            except wmi.x_wmi as e:
-                                print(f"设置显示器 {i} 亮度时WMI出错: {str(e)}")
-                            except pythoncom.com_error as e:
-                                print(f"设置显示器 {i} 亮度时COM出错: {str(e)}")
-                        if success:
-                            break
-                    else:
-                        print(f"在命名空间 {namespace} 中未找到显示器")
-                except wmi.x_wmi as e:
-                    print(f"访问命名空间 {namespace} 时WMI出错: {str(e)}")
-                except pythoncom.com_error as e:
-                    print(f"访问命名空间 {namespace} 时COM出错: {str(e)}")
-            
-            if success:
-                print(f"屏幕亮度已成功设置为: {brightness}%")
-                return True
-        except ImportError:
-            print("wmi模块未安装")
-        except wmi.x_wmi as e:
-            print(f"WMI方法出错: {str(e)}")
-        except pythoncom.com_error as e:
-            print(f"WMI方法COM错误: {str(e)}")
-        
-        # 方法2: 使用Windows API - 更底层的方法
-        print("尝试使用Windows API设置亮度...")
+                    ok = bool(lib.SetVCPFeature(handle, VCP_BRIGHTNESS, raw_target))
+                except Exception as exc:
+                    ok = False
+                    last_error = str(exc)
+                time.sleep(0.05)
+                readback, _ = _ddc_probe(handle)
+                if ok and readback is not None:
+                    percent = int(round(readback / maximum * 100))
+                    if abs(percent - target_percent) <= 2:
+                        return True, percent, ""
+                    last_error = f"回读 {percent}%，与目标 {target_percent}% 不一致"
+                elif not ok:
+                    last_error = "SetVCPFeature 失败"
+        return False, None, last_error
+    finally:
+        _ddc_destroy(handles)
+
+
+# ---------------------------------------------------------------------------
+# 软件调光兜底（伽马表）：DDC/WMI 都不可用时仍能压暗屏幕
+# ---------------------------------------------------------------------------
+
+_GAMMA_APPLIED = {}
+
+
+def _build_gamma_ramp(brightness):
+    """把 0-100 的亮度映射成 3×256 的伽马表（100 = 恒等，0 = 最暗但不是全黑）。"""
+    level = max(0.0, min(100.0, float(brightness))) / 100.0
+    gamma = 1.0 + (1.0 - level) * 2.2
+    ramp = (ctypes.c_ushort * 768)()
+    for channel in range(3):
+        base = channel * 256
+        for index in range(256):
+            ramp[base + index] = int(round(65535.0 * (index / 255.0) ** gamma))
+    return ramp
+
+
+def _gamma_set(display_name, brightness):
+    """软件调光：只能压暗，100 表示恢复原样。
+
+    Returns:
+        tuple: (ok, 当前值, 错误信息)
+    """
+    if not display_name:
+        return False, None, "缺少显示设备名，无法软件调光"
+    try:
+        gdi32 = ctypes.windll.gdi32
+        gdi32.CreateDCW.restype = ctypes.wintypes.HDC
+        gdi32.CreateDCW.argtypes = [
+            ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR,
+            ctypes.wintypes.LPCWSTR, ctypes.c_void_p,
+        ]
+        gdi32.SetDeviceGammaRamp.argtypes = [ctypes.wintypes.HDC, ctypes.c_void_p]
+        gdi32.SetDeviceGammaRamp.restype = ctypes.wintypes.BOOL
+        hdc = gdi32.CreateDCW("DISPLAY", str(display_name), None, None)
+    except Exception as exc:
+        return False, None, f"创建显示 DC 失败: {exc}"
+    if not hdc:
+        return False, None, "创建显示 DC 失败"
+    try:
+        ramp = _build_gamma_ramp(brightness)
+        ok = gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
+        if not ok:
+            return False, None, "SetDeviceGammaRamp 被驱动拒绝（HDR 模式下常见）"
+        level = int(round(float(brightness)))
+        _GAMMA_APPLIED[display_name] = level
+        return True, level, ""
+    except Exception as exc:
+        return False, None, str(exc)
+    finally:
         try:
-            # 定义必要的常量和结构体
-            DISPLAY_DEVICE = ctypes.Structure
-            MONITORINFOEX = ctypes.Structure
-            
-            # 尝试使用SetMonitorBrightness函数
-            # 注意：这需要管理员权限，并且在不同Windows版本上可能有所不同
-            user32 = ctypes.WinDLL('user32.dll')
-            gdi32 = ctypes.WinDLL('gdi32.dll')
-            
-            # 获取显示器数量
-            monitor_count = ctypes.c_int()
-            user32.EnumDisplayMonitors(None, None, lambda hMonitor, hdcMonitor, lprcMonitor, dwData: dwData.contents.value + 1, ctypes.byref(monitor_count))
-            print(f"找到 {monitor_count.value} 个显示器")
-            
-            # 注意：这里只是演示，实际的SetMonitorBrightness调用需要更复杂的实现
-            # 由于权限和兼容性问题，我们会在下面提供一个更简单的方法
-            
-        except ctypes.WinError as e:
-            print(f"Windows API方法WinError: {str(e)}")
-        except AttributeError as e:
-            print(f"Windows API方法属性错误: {str(e)}")
-        
-        # 方法3: 使用Registry方法 - 适用于某些系统
-        print("尝试使用注册表方法设置亮度...")
+            ctypes.windll.gdi32.DeleteDC(hdc)
+        except Exception:
+            pass
+
+
+def _gamma_reset(display_name):
+    """把某块屏的伽马表恢复成恒等。"""
+    if not display_name:
+        return
+    try:
+        gdi32 = ctypes.windll.gdi32
+        gdi32.CreateDCW.restype = ctypes.wintypes.HDC
+        gdi32.CreateDCW.argtypes = [
+            ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR,
+            ctypes.wintypes.LPCWSTR, ctypes.c_void_p,
+        ]
+        gdi32.SetDeviceGammaRamp.argtypes = [ctypes.wintypes.HDC, ctypes.c_void_p]
+        gdi32.SetDeviceGammaRamp.restype = ctypes.wintypes.BOOL
+        hdc = gdi32.CreateDCW("DISPLAY", str(display_name), None, None)
+        if hdc:
+            ramp = _build_gamma_ramp(100)
+            gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
+            ctypes.windll.gdi32.DeleteDC(hdc)
+    except Exception:
+        pass
+    _GAMMA_APPLIED.pop(display_name, None)
+
+
+def restore_gamma_ramps():
+    """进程退出时恢复所有被软件调光改过的屏幕。"""
+    for display_name in list(_GAMMA_APPLIED):
+        _gamma_reset(display_name)
+    _GAMMA_APPLIED.clear()
+
+
+atexit.register(restore_gamma_ramps)
+
+
+
+def _wmi_set(instance_name, value, position=0):
+    """按 InstanceName 写入 WMI 亮度；找不到时按序号回退。
+
+    Returns:
+        tuple: (ok, 回读值, 提示信息)
+    """
+    import wmi as wmi_module
+
+    com_initialized = False
+    try:
+        pythoncom.CoInitialize()
+        com_initialized = True
+    except Exception:
+        pass
+    try:
+        w = wmi_module.WMI(namespace="root\\wmi")
+        monitors = list(w.WmiMonitorBrightnessMethods())
+        if not monitors:
+            return False, None, "WMI 未找到可调光的显示器"
+        target = None
+        for monitor in monitors:
+            if str(getattr(monitor, "InstanceName", "")).upper() == str(instance_name).upper():
+                target = monitor
+                break
+        message = ""
+        if target is None:
+            index = max(0, min(int(position), len(monitors) - 1))
+            target = monitors[index]
+            message = "WMI InstanceName 未匹配，已按序号回退"
+        target.WmiSetBrightness(int(value), 0)
+        current = None
         try:
-            import winreg
-            
-            # 打开注册表项
-            key_path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000"
+            for item in w.WmiMonitorBrightness():
+                if str(item.InstanceName).upper() == str(target.InstanceName).upper():
+                    current = int(item.CurrentBrightness)
+                    break
+        except Exception:
+            current = None
+        return True, current, message
+    except Exception as exc:
+        return False, None, str(exc)
+    finally:
+        if com_initialized:
             try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE)
-                # 注意：实际的注册表键可能因系统而异
-                print("注册表访问成功")
-                winreg.CloseKey(key)
-            except FileNotFoundError:
-                print(f"注册表路径不存在: {key_path}")
-            except PermissionError:
-                print(f"没有权限访问注册表: {key_path}")
-            except OSError as e:
-                print(f"注册表访问出错: {str(e)}")
-                
-        except ImportError:
-            print("winreg模块不可用")
-        
-        # 方法4: 使用PowerShell命令 - 最可靠的方法
-        print("尝试使用PowerShell命令设置亮度...")
-        try:
-            import subprocess
-            
-            # 使用PowerShell命令设置亮度
-            # 注意：这可能需要管理员权限
-            command = f"(Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBrightnessMethods).WmiSetBrightness({brightness}, 0)"
-            result = subprocess.run(["powershell", "-Command", command], capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print(f"PowerShell命令执行成功")
-                print(f"屏幕亮度已设置为: {brightness}%")
-                return True
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+_INTERNAL_CONNECTIONS = {"内置屏", "LVDS", "DisplayPort(内置)", "UDI(内置)"}
+
+
+def _backend_order(screen):
+    """按连接类型决定调光后端优先级。
+
+    外接屏（HDMI / DisplayPort / DVI…）优先 DDC/CI：Windows 对附屏的 WMI 亮度支持
+    经常是「列得出来但写不进去」；内置屏优先 WMI。两者都失败时用伽马表软件调光兜底。
+    """
+    connection = str((screen.get("params") or {}).get("connection") or "")
+    if connection in _INTERNAL_CONNECTIONS:
+        return ["wmi", "ddc", "gamma"]
+    return ["ddc", "wmi", "gamma"]
+
+
+def list_brightness_capabilities(force_refresh=False):
+    """列出每块屏的调光后端（按优先级），并探测 DDC/CI 是否可用。
+
+    返回的 `backends` 是本次可尝试的顺序，最后一项通常是 `gamma`（软件调光兜底）；
+    `backend` 只是首选，实际写入失败时会自动降级。
+
+    Returns:
+        list[dict]: devices.enumerate_screens 的结果，另含 backends / backend / current /
+                    supported / software_only / params
+    """
+    screens = get_available_monitors(force_refresh=force_refresh)
+    result = []
+    for screen in screens:
+        wmi_available = bool(screen.get("supported"))
+        ddc = _ddc_probe_display(screen.get("display_name"))
+        ddc_available = bool(ddc.get("available"))
+
+        backends = []
+        for backend in _backend_order(screen):
+            if backend == "wmi" and wmi_available:
+                backends.append("wmi")
+            elif backend == "ddc" and ddc_available:
+                backends.append("ddc")
+            elif backend == "gamma" and screen.get("display_name"):
+                backends.append("gamma")
+
+        physical = [item for item in backends if item != "gamma"]
+        backend = backends[0] if backends else "none"
+
+        current = screen.get("current") if wmi_available else None
+        if ddc_available and ddc.get("current") is not None:
+            ddc_percent = int(round(ddc["current"] / max(ddc.get("max") or 100, 1) * 100))
+            if current is None or backend == "ddc":
+                current = ddc_percent
+
+        params = dict(screen.get("params") or {})
+        params.update({
+            "backend": backend,
+            "backends": backends,
+            "ddc": ddc_available,
+            "software_only": bool(backends) and not physical,
+        })
+        if ddc_available:
+            params["brightness_max"] = ddc.get("max")
+        elif wmi_available:
+            params["brightness_max"] = 100
+
+        result.append({
+            **screen,
+            "backend": backend,
+            "backends": backends,
+            "supported": bool(backends),
+            "software_only": params["software_only"],
+            "current": current,
+            "params": params,
+        })
+    return result
+
+
+def set_brightness_targets(targets, screens=None, verify=True):
+    """按屏幕 ID 写入亮度，按 backends 顺序自动降级。
+
+    顺序通常是：外接屏 DDC → WMI → 伽马；内置屏 WMI → DDC → 伽马。
+    某个后端写失败或回读不一致时自动尝试下一个，全部失败才返回错误。
+
+    Args:
+        targets: {screen_id: 0-100}
+        screens: 可用屏幕列表（默认现枚举一次）
+        verify: 物理后端写后回读校验，偏差 > 2 视为失败
+
+    Returns:
+        dict: {screen_id: {"ok", "backend", "current", "error"}}
+    """
+    if screens is None:
+        screens = list_brightness_capabilities(force_refresh=True)
+    by_id = {screen["id"]: screen for screen in screens}
+    results = {}
+    for screen_id, value in targets.items():
+        screen = by_id.get(screen_id)
+        if screen is None:
+            results[screen_id] = {"ok": False, "backend": "none", "current": None, "error": "屏幕不在当前列表"}
+            continue
+
+        target = max(0, min(100, int(round(float(value)))))
+        backends = list(screen.get("backends") or [])
+        if not backends:
+            preferred = screen.get("backend")
+            if preferred and preferred != "none":
+                backends = [preferred]
+        if "gamma" not in backends and screen.get("display_name"):
+            backends.append("gamma")
+
+        errors = []
+        settled = False
+        for backend in backends:
+            display_name = screen.get("display_name", "")
+            if backend == "wmi":
+                ok, current, error = _wmi_set(
+                    screen.get("instance_name", ""), target, screen.get("index", 0)
+                )
+            elif backend == "ddc":
+                ok, current, error = _ddc_set(display_name, target)
+            elif backend == "gamma":
+                ok, current, error = _gamma_set(display_name, target)
             else:
-                print(f"PowerShell命令执行失败: {result.stderr}")
-                
-        except FileNotFoundError:
-            print("PowerShell命令未找到")
-        except subprocess.CalledProcessError as e:
-            print(f"PowerShell命令执行错误: {str(e)}")
-        except OSError as e:
-            print(f"PowerShell方法系统错误: {str(e)}")
-        
-        # 如果所有方法都失败
-        print("警告: 所有设置亮度的方法都失败了")
-        print("请尝试以下解决方案:")
-        print("1. 以管理员身份运行此脚本")
-        print("2. 确保您的显示器支持软件亮度调节")
-        print("3. 检查显示器驱动程序是否已更新")
-        
+                continue
+
+            if ok and verify and backend in ("wmi", "ddc") and current is not None:
+                if abs(current - target) > 2:
+                    ok = False
+                    error = f"写入后回读 {current}，与目标 {target} 不一致"
+
+            if ok:
+                if backend != "gamma" and display_name in _GAMMA_APPLIED:
+                    _gamma_reset(display_name)
+                results[screen_id] = {
+                    "ok": True, "backend": backend, "current": current, "error": ""
+                }
+                settled = True
+                break
+            errors.append(f"{backend}: {error or '失败'}")
+
+        if not settled:
+            results[screen_id] = {
+                "ok": False,
+                "backend": "none",
+                "current": None,
+                "error": "；".join(errors) or "没有可用的调光后端",
+            }
+    return results
+
+
+
+def adjust_brightness(target_brightness, monitor_indices=None):
+    """兼容旧接口：把同一个亮度写到选中的屏幕序号上。
+
+    Args:
+        target_brightness: 0-100
+        monitor_indices: 屏幕枚举序号列表，None 表示全部
+
+    Returns:
+        bool: 是否至少有一块屏写入成功
+    """
+    screens = get_available_monitors()
+    selected = None if monitor_indices is None else set(int(i) for i in monitor_indices)
+    targets = {}
+    for screen in screens:
+        if selected is None or screen.get("index") in selected:
+            targets[screen["id"]] = target_brightness
+    if not targets:
         return False
-        
-    except ValueError as e:
-        print(f"设置亮度时参数错误: {str(e)}")
-        return False
-    except Exception as e:
-        print(f"设置亮度时出错: {str(e)}")
-        return False
+    results = set_brightness_targets(targets, screens=screens)
+    return any(item["ok"] for item in results.values())
+
 
 class BrightnessNeuralNetwork:
     """亮度神经网络类，用于处理亮度值并输出新的评分"""
@@ -653,17 +869,24 @@ class BrightnessNeuralNetwork:
         self.weights = []
         self.biases = []
         
+        # He 初始化（ReLU）/ Xavier 初始化（tanh）
+        # 旧实现用 0.01 的固定缩放，偶发「所有隐藏层 ReLU 全部失活 → 输出恒定」，
+        # 初始化尺度随扇入自适应后，激活值和梯度都能保持在合理量级。
+        def _init_weight(fan_in, fan_out):
+            scale = 2.0 if self.activation == 'relu' else 1.0
+            return np.random.randn(fan_in, fan_out) * np.sqrt(scale / max(fan_in, 1))
+        
         # 输入层到第一个隐藏层
-        self.weights.append(np.random.randn(input_size, hidden_sizes[0]) * 0.01)
+        self.weights.append(_init_weight(input_size, hidden_sizes[0]))
         self.biases.append(np.zeros((1, hidden_sizes[0])))
         
         # 隐藏层之间的连接
         for i in range(self.num_hidden_layers - 1):
-            self.weights.append(np.random.randn(hidden_sizes[i], hidden_sizes[i+1]) * 0.01)
+            self.weights.append(_init_weight(hidden_sizes[i], hidden_sizes[i+1]))
             self.biases.append(np.zeros((1, hidden_sizes[i+1])))
         
         # 最后一个隐藏层到输出层
-        self.weights.append(np.random.randn(hidden_sizes[-1], output_size) * 0.01)
+        self.weights.append(_init_weight(hidden_sizes[-1], output_size))
         self.biases.append(np.zeros((1, output_size)))
         
         # 初始化Adam优化器参数
@@ -678,6 +901,9 @@ class BrightnessNeuralNetwork:
             self.v_weights = [np.zeros_like(w) for w in self.weights]
             self.m_biases = [np.zeros_like(b) for b in self.biases]
             self.v_biases = [np.zeros_like(b) for b in self.biases]
+        
+        # 新建模型的训练目标即为当前版本
+        self.target_version = TARGET_VERSION
     
     def _get_cache_key(self, features):
         """生成缓存键
@@ -696,6 +922,41 @@ class BrightnessNeuralNetwork:
         """清空缓存"""
         if self.use_cache:
             self.cache.clear()
+    
+    def _normalize_features(self, features_array):
+        """把原始特征映射到 0-1 区间
+
+        单样本和批量训练共用同一套映射，避免两条路径的归一化方式不一致。
+
+        Args:
+            features_array: 形状为 (14,) 或 (N, 14) 的特征数组
+
+        Returns:
+            np.ndarray: 与输入同形状的 float32 归一化特征
+        """
+        features_array = np.asarray(features_array, dtype=np.float64)
+        normalized_features = np.zeros_like(features_array, dtype=np.float32)
+        
+        # 平均亮度（0-255）
+        normalized_features[..., 0] = features_array[..., 0] / 255
+        # 对比度值、感知亮度、空间加权亮度（0-255）
+        normalized_features[..., [1, 8, 9, 13]] = features_array[..., [1, 8, 9, 13]] / 255
+        # 亮度变化率（0-255）
+        normalized_features[..., 2] = np.minimum(features_array[..., 2] / 255, 1.0)
+        # 移动平均亮度（0-255）
+        normalized_features[..., 3] = features_array[..., 3] / 255
+        # RGB值（0-255）
+        normalized_features[..., [4, 5, 6]] = features_array[..., [4, 5, 6]] / 255
+        # 色彩饱和度（0-255）
+        normalized_features[..., 7] = features_array[..., 7] / 255
+        # 亮度峰度（0-6，越接近3越好）
+        normalized_features[..., 10] = np.clip((3.0 - np.abs(features_array[..., 10] - 3.0)) / 3.0, 0.0, 1.0)
+        # 亮度偏度（-5到5，越接近0越好）
+        normalized_features[..., 11] = np.clip((1.0 - np.abs(features_array[..., 11]) / 10.0), 0.0, 1.0)
+        # 清晰度（0-无上限，需要归一化到0-1）
+        normalized_features[..., 12] = np.minimum(features_array[..., 12] / 2000, 1.0)
+        
+        return normalized_features
     
     def forward(self, features, training=False):
         """前向传播计算
@@ -716,31 +977,8 @@ class BrightnessNeuralNetwork:
                 self.cache.move_to_end(cache_key)
                 return self.cache[cache_key]
         
-        # 归一化输入特征 - 使用向量化操作优化
-        features_array = np.array(features)
-        normalized_features = np.zeros_like(features_array, dtype=np.float32)
-        
-        # 特征归一化
-        # 平均亮度（0-255）
-        normalized_features[0] = features_array[0] / 255
-        # 对比度值、感知亮度、空间加权亮度（0-255）
-        normalized_features[[1, 8, 9, 13]] = features_array[[1, 8, 9, 13]] / 255
-        # 亮度变化率（0-255）
-        normalized_features[2] = min(features_array[2] / 255, 1.0)
-        # 移动平均亮度（0-255）
-        normalized_features[3] = features_array[3] / 255
-        # RGB值（0-255）
-        normalized_features[[4, 5, 6]] = features_array[[4, 5, 6]] / 255
-        # 色彩饱和度（0-255）
-        normalized_features[7] = features_array[7] / 255
-        # 亮度峰度（0-6，越接近3越好）
-        normalized_features[10] = np.clip((3.0 - abs(features_array[10] - 3.0)) / 3.0, 0.0, 1.0)
-        # 亮度偏度（-5到5，越接近0越好）
-        normalized_features[11] = np.clip((1.0 - abs(features_array[11]) / 10.0), 0.0, 1.0)
-        # 清晰度（0-无上限，需要归一化到0-1）
-        normalized_features[12] = min(features_array[12] / 2000, 1.0)
-        
-        normalized_input = normalized_features.reshape(1, -1)  # 转换为2D数组
+        # 归一化输入特征（与批量训练共用同一套映射）
+        normalized_input = self._normalize_features(np.asarray(features, dtype=np.float64)).reshape(1, -1)
         
         # 前向传播计算 - 统一流程（不再分训练和非训练分支）
         activations = [normalized_input]
@@ -787,132 +1025,188 @@ class BrightnessNeuralNetwork:
             
             return result
     
-    def train(self, X, y, learning_rate=0.001, epochs=2000, batch_size=64, lr_decay=0.995, log_callback=None):
-        """训练神经网络
-        
+    def _forward_batch(self, normalized_input):
+        """对一批归一化输入执行前向传播
+
+        Args:
+            normalized_input: 形状为 (N, input_size) 的归一化特征
+
+        Returns:
+            tuple: (输出 (N, 1), 各层激活值列表, 各层 z 值列表)
+        """
+        activations = [normalized_input]
+        z_values = []
+        current_input = normalized_input
+
+        for i in range(self.num_hidden_layers):
+            z = np.dot(current_input, self.weights[i]) + self.biases[i]
+            z_values.append(z)
+            if self.activation == 'relu':
+                activation = np.maximum(0, z)
+            else:  # tanh
+                activation = np.tanh(z)
+            activations.append(activation)
+            current_input = activation
+
+        output_z = np.dot(current_input, self.weights[-1]) + self.biases[-1]
+        z_values.append(output_z)
+        output = 1 / (1 + np.exp(-output_z))
+        activations.append(output)
+        return output, activations, z_values
+
+    def _apply_gradients(self, grads_w, grads_b, learning_rate):
+        """把整批梯度一次性应用到所有参数（Adam 或 SGD）
+
+        Args:
+            grads_w: 每一层权重的梯度列表
+            grads_b: 每一层偏置的梯度列表
+            learning_rate: 当前学习率
+        """
+        if self.use_adam:
+            self.t += 1
+            bias_correction1 = 1 - self.beta1 ** self.t
+            bias_correction2 = 1 - self.beta2 ** self.t
+
+        for i in range(len(self.weights)):
+            g_w = grads_w[i]
+            g_b = grads_b[i]
+            if self.use_adam:
+                self.m_weights[i] = self.beta1 * self.m_weights[i] + (1 - self.beta1) * g_w
+                self.v_weights[i] = self.beta2 * self.v_weights[i] + (1 - self.beta2) * (g_w ** 2)
+                m_hat_w = self.m_weights[i] / bias_correction1
+                v_hat_w = self.v_weights[i] / bias_correction2
+                self.weights[i] -= learning_rate * m_hat_w / (np.sqrt(v_hat_w) + self.epsilon)
+
+                self.m_biases[i] = self.beta1 * self.m_biases[i] + (1 - self.beta1) * g_b
+                self.v_biases[i] = self.beta2 * self.v_biases[i] + (1 - self.beta2) * (g_b ** 2)
+                m_hat_b = self.m_biases[i] / bias_correction1
+                v_hat_b = self.v_biases[i] / bias_correction2
+                self.biases[i] -= learning_rate * m_hat_b / (np.sqrt(v_hat_b) + self.epsilon)
+            else:
+                self.weights[i] -= learning_rate * g_w
+                self.biases[i] -= learning_rate * g_b
+
+    def train(self, X, y, learning_rate=0.001, epochs=2000, batch_size=64, lr_decay=0.995,
+              log_callback=None, val_split=0.15, patience=120, verbose_interval=100):
+        """训练神经网络（批量向量化实现）
+
+        目标函数、激活函数与 Adam 公式与逐样本实现完全一致，只是把一个批次内
+        所有样本的梯度合并成一次矩阵运算，训练速度约提升两个数量级。
+
         Args:
             X: 输入数据（特征列表，每个元素是一个特征向量）
-            y: 目标输出值列表
+            y: 目标输出值列表（0-100）
             learning_rate: 学习率
             epochs: 训练轮数
             batch_size: 批量大小
-            lr_decay: 学习率衰减因子（默认0.995）
+            lr_decay: 保留参数，兼容旧调用（当前使用固定学习率）
             log_callback: 日志回调函数，用于将训练信息传递给GUI界面
+            val_split: 验证集比例（样本数 >= 40 时启用），用于早停
+            patience: 验证集连续多少轮没有改善就停止
+            verbose_interval: 每隔多少轮输出一次日志
         """
-        # 训练循环
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        if X.shape[0] == 0:
+            return
+
+        normalized_X = self._normalize_features(X)
+        normalized_y = np.clip(y, 0.0, 100.0) / 100.0
+
+        # 划分训练集 / 验证集
+        n_samples = normalized_X.shape[0]
+        n_val = int(round(n_samples * val_split)) if n_samples >= 40 else 0
+        indices = np.random.permutation(n_samples)
+        val_indices = indices[:n_val]
+        train_indices = indices[n_val:]
+
+        X_train = normalized_X[train_indices]
+        y_train = normalized_y[train_indices]
+        X_val = normalized_X[val_indices] if n_val else None
+        y_val = normalized_y[val_indices] if n_val else None
+
+        batch_size = max(1, int(batch_size))
+        best_val_loss = np.inf
+        best_weights = None
+        best_biases = None
+        epochs_without_improvement = 0
+
         for epoch in range(epochs):
-            # 使用固定学习率，不进行衰减
+            # 使用固定学习率，不进行衰减（与旧实现保持一致）
             current_lr = learning_rate
-            
-            # 随机打乱数据
-            indices = np.arange(len(X))
-            np.random.shuffle(indices)
-            X_shuffled = np.array(X)[indices]
-            y_shuffled = np.array(y)[indices]
-            
-            # 批量训练
-            for i in range(0, len(X_shuffled), batch_size):
-                # 获取当前批次
-                batch_end = min(i + batch_size, len(X_shuffled))
-                batch_X = X_shuffled[i:batch_end]
-                batch_y = y_shuffled[i:batch_end] / 100  # 将0-100映射到0-1
-                batch_y = batch_y.reshape(-1, 1)
-                
-                # 逐个样本训练
-                for j in range(len(batch_X)):
-                    # 前向传播 - 获取当前样本的输出和中间值
-                    output, activations, z_values = self.forward(batch_X[j], training=True)
-                    
-                    # 计算输出层梯度 (sigmoid导数 * MSE导数)
-                    # sigmoid导数: sigmoid(x) * (1 - sigmoid(x)) = output * (1 - output)
-                    delta = (output - batch_y[j:j+1]) * output * (1 - output)
-                    
-                    # 更新参数
-                    if self.use_adam:
-                        # Adam优化器更新
-                        self.t += 1
-                        
-                        # 更新输出层参数
-                        # 权重更新
-                        g_w = activations[-2].T.dot(delta)
-                        self.m_weights[-1] = self.beta1 * self.m_weights[-1] + (1 - self.beta1) * g_w
-                        self.v_weights[-1] = self.beta2 * self.v_weights[-1] + (1 - self.beta2) * (g_w ** 2)
-                        m_hat_w = self.m_weights[-1] / (1 - self.beta1 ** self.t)
-                        v_hat_w = self.v_weights[-1] / (1 - self.beta2 ** self.t)
-                        self.weights[-1] -= current_lr * m_hat_w / (np.sqrt(v_hat_w) + self.epsilon)
-                        
-                        # 偏置更新
-                        g_b = np.sum(delta, axis=0, keepdims=True)
-                        self.m_biases[-1] = self.beta1 * self.m_biases[-1] + (1 - self.beta1) * g_b
-                        self.v_biases[-1] = self.beta2 * self.v_biases[-1] + (1 - self.beta2) * (g_b ** 2)
-                        m_hat_b = self.m_biases[-1] / (1 - self.beta1 ** self.t)
-                        v_hat_b = self.v_biases[-1] / (1 - self.beta2 ** self.t)
-                        self.biases[-1] -= current_lr * m_hat_b / (np.sqrt(v_hat_b) + self.epsilon)
-                        
-                        # 反向传播通过隐藏层
-                        for k in range(self.num_hidden_layers, 0, -1):
-                            # 计算当前层的梯度
-                            if self.activation == 'relu':
-                                delta = delta.dot(self.weights[k].T) * relu_derivative(z_values[k-1])
-                            else:  # tanh
-                                delta = delta.dot(self.weights[k].T) * tanh_derivative(activations[k])
-                            
-                            # 权重更新
-                            g_w = activations[k-1].T.dot(delta)
-                            self.m_weights[k-1] = self.beta1 * self.m_weights[k-1] + (1 - self.beta1) * g_w
-                            self.v_weights[k-1] = self.beta2 * self.v_weights[k-1] + (1 - self.beta2) * (g_w ** 2)
-                            m_hat_w = self.m_weights[k-1] / (1 - self.beta1 ** self.t)
-                            v_hat_w = self.v_weights[k-1] / (1 - self.beta2 ** self.t)
-                            self.weights[k-1] -= current_lr * m_hat_w / (np.sqrt(v_hat_w) + self.epsilon)
-                            
-                            # 偏置更新
-                            g_b = np.sum(delta, axis=0, keepdims=True)
-                            self.m_biases[k-1] = self.beta1 * self.m_biases[k-1] + (1 - self.beta1) * g_b
-                            self.v_biases[k-1] = self.beta2 * self.v_biases[k-1] + (1 - self.beta2) * (g_b ** 2)
-                            m_hat_b = self.m_biases[k-1] / (1 - self.beta1 ** self.t)
-                            v_hat_b = self.v_biases[k-1] / (1 - self.beta2 ** self.t)
-                            self.biases[k-1] -= current_lr * m_hat_b / (np.sqrt(v_hat_b) + self.epsilon)
-                    else:
-                        # 标准SGD更新
-                        # 更新最后一层权重和偏置
-                        self.weights[-1] -= current_lr * activations[-2].T.dot(delta)
-                        self.biases[-1] -= current_lr * np.sum(delta, axis=0, keepdims=True)
-                        
-                        # 反向传播通过隐藏层
-                        for k in range(self.num_hidden_layers, 0, -1):
-                            # 计算当前层的梯度
-                            if self.activation == 'relu':
-                                delta = delta.dot(self.weights[k].T) * relu_derivative(z_values[k-1])
-                            else:  # tanh
-                                delta = delta.dot(self.weights[k].T) * tanh_derivative(activations[k])
-                            
-                            self.weights[k-1] -= current_lr * activations[k-1].T.dot(delta)
-                            self.biases[k-1] -= current_lr * np.sum(delta, axis=0, keepdims=True)
-            
-            # 每100轮打印一次损失
-            if epoch % 100 == 0:
-                # 清空缓存后计算当前损失，确保使用最新的权重
-                self.clear_cache()
-                predictions = np.array([self.forward(x, training=True)[0][0,0] * 100 for x in X])
-                avg_loss = np.mean(0.5 * (predictions - y) ** 2)
-                mae = np.mean(np.abs(predictions - y))
-                
-                # 构建日志消息
+
+            permutation = np.random.permutation(X_train.shape[0])
+            for start in range(0, X_train.shape[0], batch_size):
+                batch_indices = permutation[start:start + batch_size]
+                if batch_indices.size == 0:
+                    continue
+                batch_X = X_train[batch_indices]
+                batch_y = y_train[batch_indices].reshape(-1, 1)
+
+                output, activations, z_values = self._forward_batch(batch_X)
+
+                # 输出层梯度（sigmoid 导数 * MSE 导数），按批大小取平均
+                delta = (output - batch_y) * output * (1 - output) / batch_X.shape[0]
+
+                grads_w = [None] * len(self.weights)
+                grads_b = [None] * len(self.biases)
+
+                grads_w[-1] = activations[-2].T.dot(delta)
+                grads_b[-1] = np.sum(delta, axis=0, keepdims=True)
+
+                # 反向传播通过隐藏层
+                for k in range(self.num_hidden_layers, 0, -1):
+                    if self.activation == 'relu':
+                        delta = delta.dot(self.weights[k].T) * relu_derivative(z_values[k - 1])
+                    else:  # tanh
+                        delta = delta.dot(self.weights[k].T) * tanh_derivative(activations[k])
+                    grads_w[k - 1] = activations[k - 1].T.dot(delta)
+                    grads_b[k - 1] = np.sum(delta, axis=0, keepdims=True)
+
+                self._apply_gradients(grads_w, grads_b, current_lr)
+
+            # 定期输出训练/验证损失
+            if epoch % verbose_interval == 0 or epoch == epochs - 1:
+                train_predictions = self._forward_batch(X_train)[0][:, 0] * 100
+                avg_loss = np.mean(0.5 * (train_predictions - y_train * 100) ** 2)
+                mae = np.mean(np.abs(train_predictions - y_train * 100))
+
                 log_msg = f"Epoch {epoch}, Loss: {avg_loss:.4f}, MAE: {mae:.2f}"
-                
-                # 打印到控制台并记录到日志回调
-                #print(log_msg)
+                val_loss = None
+                if X_val is not None:
+                    val_predictions = self._forward_batch(X_val)[0][:, 0] * 100
+                    val_loss = np.mean(0.5 * (val_predictions - y_val * 100) ** 2)
+                    log_msg += f", ValLoss: {val_loss:.4f}"
                 if log_callback:
                     log_callback(log_msg)
-                
-                # 当损失值小于0.5时，提前收敛
+
+                # 当损失值小于0.5时，提前收敛（保留原有行为）
                 if avg_loss < 0.5:
-                    converge_msg = f"损失值已小于0.5，提前收敛，训练结束"
-                    #print(converge_msg)
-                    
                     if log_callback:
-                        log_callback(converge_msg)
+                        log_callback("损失值已小于0.5，提前收敛，训练结束")
+                    self.clear_cache()
                     return
+
+                # 验证集早停
+                if val_loss is not None:
+                    if val_loss < best_val_loss - 1e-4:
+                        best_val_loss = val_loss
+                        best_weights = [w.copy() for w in self.weights]
+                        best_biases = [b.copy() for b in self.biases]
+                        epochs_without_improvement = 0
+                    else:
+                        epochs_without_improvement += verbose_interval
+                        if epochs_without_improvement >= patience:
+                            if log_callback:
+                                log_callback(f"验证集 {patience} 轮没有改善，提前停止训练")
+                            break
+
+        # 回滚到验证集表现最好的参数
+        if best_weights is not None:
+            self.weights = best_weights
+            self.biases = best_biases
+
+        self.clear_cache()
     
     def evaluate(self, X, y):
         """评估模型性能
@@ -948,7 +1242,8 @@ class BrightnessNeuralNetwork:
             'output_size': self.output_size,
             'activation': self.activation,
             'use_adam': self.use_adam,
-            'use_cache': self.use_cache
+            'use_cache': self.use_cache,
+            'target_version': TARGET_VERSION,
         }
         
         # 保存权重和偏置
@@ -985,11 +1280,14 @@ class BrightnessNeuralNetwork:
         self.activation = data.get('activation', 'relu')  # 默认使用relu
         self.use_adam = data.get('use_adam', True)  # 默认使用Adam
         self.use_cache = data.get('use_cache', True)  # 默认使用缓存
+        # 旧模型没有这个字段，按 0 处理，应用据此触发重新训练
+        self.target_version = int(data.get('target_version', 0))
         self.num_hidden_layers = len(self.hidden_sizes)
         
         # 初始化缓存
         if self.use_cache:
-            self.cache = {}  # 缓存输入特征到输出的映射
+            from collections import OrderedDict
+            self.cache = OrderedDict()  # 缓存输入特征到输出的映射（必须支持 move_to_end）
             self.cache_size = 1000  # 缓存大小限制
         
         # 加载权重和偏置
@@ -1165,84 +1463,123 @@ def check_brightness_dominance(frame, threshold=127):
     
     return bright_ratio_int
 
-def generate_synthetic_data(num_samples=1000):
+def synthesize_features(ambient, screen_level, screen_content, seed=None,
+                        glow_gain=None, exposure=None, texture=None, warm=None):
+    """由潜在变量生成 14 维特征
+
+    物理模型把摄像头读数拆成两部分：
+        scene_luma  = 环境光照贡献（真正要学习的因素）
+        screen_glow = 屏幕亮度 × 屏幕内容亮度 × 耦合系数（干扰因素）
+
+    这个函数只负责「给定环境光和屏幕状态，摄像头会读到什么」，不含目标值，
+    因此训练、离线评估、回归测试可以共用同一套前向模型。
+
+    Args:
+        ambient: 环境光照水平 0-1（数组）
+        screen_level: 屏幕亮度 0-1（数组，干扰变量）
+        screen_content: 屏幕内容平均亮度 0-1（数组，干扰变量）
+        seed: 随机种子
+        glow_gain / exposure / texture / warm: 可选，固定干扰系数（默认随机采样），
+            仅用于离线评估时做单变量对照
+
+    Returns:
+        np.ndarray: 形状为 (N, 14) 的特征矩阵
+    """
+    rng = np.random.default_rng(seed)
+    ambient = np.asarray(ambient, dtype=np.float64).reshape(-1)
+    screen_level = np.asarray(screen_level, dtype=np.float64).reshape(-1)
+    screen_content = np.asarray(screen_content, dtype=np.float64).reshape(-1)
+    n = ambient.shape[0]
+
+    if glow_gain is None:
+        glow_gain = rng.uniform(SCREEN_GLOW_MIN, SCREEN_GLOW_MAX, n)  # 屏幕发光对摄像头读数的耦合系数
+    else:
+        glow_gain = np.broadcast_to(np.asarray(glow_gain, dtype=np.float64), (n,))
+    if exposure is None:
+        exposure = np.exp(rng.normal(0.0, 0.10, n))             # 摄像头曝光差异
+    else:
+        exposure = np.broadcast_to(np.asarray(exposure, dtype=np.float64), (n,))
+    if texture is None:
+        texture = rng.uniform(0.55, 1.45, n)                    # 画面纹理反差
+    else:
+        texture = np.broadcast_to(np.asarray(texture, dtype=np.float64), (n,))
+    if warm is None:
+        warm = rng.normal(0.0, 0.04, n)                         # 环境色温偏移
+    else:
+        warm = np.broadcast_to(np.asarray(warm, dtype=np.float64), (n,))
+
+    # 摄像头读数 = 环境光 + 屏幕发光
+    scene = SCENE_FLOOR + SCENE_RANGE * ambient
+    glow = glow_gain * screen_level * screen_content
+    mu = np.clip(scene * exposure + glow, 0.02, 0.98)
+
+    gamma = 1.0 / 2.2
+    gamma_mu = 255.0 * np.power(mu, gamma)
+    sigma = (0.05 + 0.14 * texture) * 2.0 * np.sqrt(np.clip(mu * (1.0 - mu), 0.0, 0.25))
+    sigma = np.clip(sigma, 0.01, 0.45)
+
+    average_brightness = 255.0 * mu
+    contrast = 255.0 * sigma
+    # 伽马校正后的标准差，与真实特征提取的口径保持一致
+    brightness_std = 255.0 * gamma * np.power(np.clip(mu, 0.02, 1.0), gamma - 1.0) * sigma
+
+    avg_r = 255.0 * np.clip(mu * (1.0 + warm), 0.0, 1.0)
+    avg_g = 255.0 * np.clip(mu * (1.0 - 0.15 * warm), 0.0, 1.0)
+    screen_blue = 0.06 * screen_level * (0.3 + 0.7 * screen_content)
+    avg_b = 255.0 * np.clip(mu * (1.0 - 0.85 * warm + screen_blue), 0.0, 1.0)
+
+    saturation = 255.0 * np.clip(
+        0.07 + 0.30 * rng.beta(1.5, 3.0, n) + 0.20 * np.abs(warm), 0.02, 0.85
+    )
+    perceived_brightness = np.clip(gamma_mu + rng.normal(0.0, 1.5, n), 0.0, 255.0)
+    weighted_brightness = np.clip(
+        gamma_mu * (1.0 + 0.05 * rng.normal(0.0, 1.0, n)), 0.0, 255.0
+    )
+    moving_avg = np.clip(average_brightness + rng.normal(0.0, 1.2, n), 0.0, 255.0)
+    brightness_change = np.abs(rng.normal(1.5, 1.2, n))
+
+    brightness_kurtosis = np.clip(
+        3.0 + rng.normal(0.0, 1.1, n) + 2.0 * screen_content * (1.0 - screen_content),
+        1.3, 12.0
+    )
+    brightness_skewness = np.clip(rng.normal(0.0, 0.35, n), -2.0, 2.0)
+    clarity = 400.0 * np.power(contrast / 40.0, 1.7) * np.exp(rng.normal(0.0, 0.4, n))
+    clarity = np.clip(clarity, 3.0, 5000.0)
+
+    return np.column_stack([
+        average_brightness, contrast, brightness_change, moving_avg,
+        avg_r, avg_g, avg_b, saturation,
+        perceived_brightness, brightness_std,
+        brightness_kurtosis, brightness_skewness, clarity, weighted_brightness
+    ])
+
+
+def generate_synthetic_data(num_samples=1000, seed=None):
     """生成合成训练数据
-    
+
+    目标亮度只由环境光照水平决定；屏幕亮度 / 屏幕内容亮度在采样时与目标完全
+    独立，因此训练出来的网络不会因为屏幕内容变亮而抬高推荐亮度。
+
     Args:
         num_samples: 生成的样本数量
-        
+        seed: 随机种子（便于复现）
+
     Returns:
-        tuple: 包含特征矩阵和目标值列表的元组
+        tuple: (特征矩阵列表, 目标值列表)
     """
-    X = []
-    y = []
-    
-    for _ in range(num_samples):
-        # 生成随机特征（模拟摄像头和屏幕参数）
-        brightness = np.random.uniform(0, 255)
-        contrast = np.random.uniform(0, 255)
-        brightness_change = np.random.uniform(0, 255)
-        moving_avg = np.random.uniform(0, 255)
-        avg_r = np.random.uniform(0, 255)
-        avg_g = np.random.uniform(0, 255)
-        avg_b = np.random.uniform(0, 255)
-        saturation = np.random.uniform(0, 255)
-        perceived_brightness = np.random.uniform(0, 255)
-        brightness_std = np.random.uniform(0, 255)
-        brightness_kurtosis = np.random.uniform(0, 6)
-        brightness_skewness = np.random.uniform(-5, 5)
-        clarity = np.random.uniform(0, 2000)
-        weighted_brightness = np.random.uniform(0, 255)
-        
-        # 构建特征向量（包含所有摄像头和屏幕参数）
-        features = [
-            brightness,
-            contrast,
-            brightness_change,
-            moving_avg,
-            avg_r,
-            avg_g,
-            avg_b,
-            saturation,
-            perceived_brightness,
-            brightness_std,
-            brightness_kurtosis,
-            brightness_skewness,
-            clarity,
-            weighted_brightness
-        ]
-        
-        # 计算屏幕暗度指标：RGB平均值越低，屏幕越暗，暗度值越高
-        avg_rgb = (avg_r + avg_g + avg_b) / 3
-        screen_darkness = (255 - avg_rgb) / 255  # 0表示极亮，1表示极暗
-        
-        # 屏幕颜色对亮度的影响权重
-        screen_color_weight = 0.15  # 新增：屏幕颜色影响权重为15%
-        
-        # 使用与calculate_average_brightness相同的加权计算，并增加屏幕颜色的影响
-        weighted_score = (
-            0.35 * weighted_brightness +      # 加权平均亮度占 35%
-            0.15 * brightness +       # 平均亮度占 15%
-            0.10 * (1.0 - brightness_std / 255.0) +  # 亮度标准差（越小越好）占 10%
-            0.05 * (1.0 - min(brightness_change / 255.0, 1.0)) +  # 亮度变化率（越小越好）占 5%
-            0.10 * moving_avg +   # 移动平均亮度占 10%
-            0.10 * contrast +       # 平均对比度占 10%
-            0.05 * saturation +         # 色彩饱和度占 5%
-            0.05 * perceived_brightness +  # 感知亮度占 5%
-            0.03 * (3.0 - abs(brightness_kurtosis - 3.0)) / 3.0 +  # 亮度分布峰度（越接近正态越好）占 3%
-            0.02 * (1.0 - abs(brightness_skewness) / 10.0) +  # 亮度分布偏度（越对称越好）占 2%
-            screen_color_weight * screen_darkness  # 新增：屏幕暗度影响占 15% - 屏幕越暗，推荐亮度越高
-        )
-        
-        # 将综合评分映射到 0-100 的范围
-        normalized_score = np.clip(weighted_score, 0, 255)  # 确保不会超过 255
-        target = int((normalized_score / 255) * 100)  # 映射到 0-100 之间
-        target = np.clip(target, 0, 100)
-        
-        X.append(features)
-        y.append(target)
-    
-    return X, y
+    rng = np.random.default_rng(seed)
+
+    ambient = rng.beta(1.6, 1.6, num_samples)          # 环境光照水平 0-1（目标唯一来源）
+    screen_level = rng.uniform(0.0, 1.0, num_samples)  # 屏幕亮度 0-100%（干扰）
+    screen_content = rng.beta(2.0, 2.0, num_samples)   # 屏幕内容平均亮度 0-1（干扰）
+
+    features_matrix = synthesize_features(ambient, screen_level, screen_content, seed=seed)
+
+    # 目标亮度：只由环境光照决定（外加一点逐用户抖动）
+    target = ambient_to_target(ambient) + rng.normal(0.0, 4.0, num_samples)
+    target = np.clip(target, 5.0, 100.0)
+
+    return features_matrix.tolist(), target.tolist()
 
 # 主函数，用于直接运行脚本时执行
 if __name__ == "__main__":
