@@ -506,9 +506,14 @@ def _connection_name(value):
         number = int(value)
     except (TypeError, ValueError):
         return ""
-    if number > 0x7FFFFFFF:
-        number -= 0x100000000
-    return _CONNECTION_NAMES.get(number, f"未知({number})")
+    # WMI 可能给有符号或无符号，先按原值查一次（0x80000000 = 内置屏），
+    # 再在 32 位有/无符号之间转换后重试。
+    if number in _CONNECTION_NAMES:
+        return _CONNECTION_NAMES[number]
+    converted = number + 0x100000000 if number < 0 else number - 0x100000000
+    if converted in _CONNECTION_NAMES:
+        return _CONNECTION_NAMES[converted]
+    return f"未知({number})"
 
 
 def _screen_display_name(params, device):

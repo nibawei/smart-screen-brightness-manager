@@ -242,5 +242,89 @@ class NotifyRoutingTest(unittest.TestCase):
         self.assertEqual(app_module._normalize_display_name("display2"), "DISPLAY2")
 
 
+class DeviceTableTest(unittest.TestCase):
+    """已登记设备表格：行数据与删除逻辑。"""
+
+    class DummyConfig:
+        def __init__(self):
+            self.data = {}
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+        def set(self, key, value):
+            self.data[key] = value
+
+    def setUp(self):
+        original = app_module.config_manager
+        app_module.config_manager = self.DummyConfig()
+        self.addCleanup(setattr, app_module, "config_manager", original)
+
+    def make(self):
+        tmp = tempfile.mkdtemp(prefix="device-table-")
+        os.makedirs(os.path.join(tmp, "samples"), exist_ok=True)
+        obj = object.__new__(app_module.BrightnessManagerApp)
+        obj.data_root = tmp
+        obj.devices_registry = {
+            "cameras": {
+                "cam-a": {
+                    "name": "USB Cam", "connected": True, "trained": True,
+                    "sample_count": 3, "resolution": "640x480",
+                },
+            },
+            "screens": {
+                "scr-a": {
+                    "name": "APT HDMI", "connected": False, "trained": False,
+                    "sample_count": 0,
+                    "params": {"connection": "HDMI", "resolution": "1920x1080", "size_cm": "34x19"},
+                },
+            },
+        }
+        obj.camera_models = {"cam-a": object()}
+        obj.screen_curves = {"scr-a": object()}
+        obj.screen_states = {"scr-a": {"brightness": 40}}
+        obj.available_cameras = [{"camera_id": "cam-a", "name": "USB Cam"}]
+        obj.available_monitors = [{"id": "scr-a", "name": "APT HDMI"}]
+        obj.active_screen_id = "scr-a"
+        obj.log_info = lambda message: None
+        obj.log_warning = lambda message: None
+        return obj, tmp
+
+    def test_device_rows(self):
+        obj, _ = self.make()
+        rows = obj._device_rows()
+        self.assertEqual(len(rows), 2)
+        camera = next(row for row in rows if row["kind"] == "camera")
+        screen = next(row for row in rows if row["kind"] == "screen")
+        self.assertEqual(camera["status"], "已接入")
+        self.assertEqual(camera["trained"], "是")
+        self.assertEqual(screen["status"], "未接入")
+        self.assertIn("HDMI", screen["detail"])
+        self.assertIn("1920x1080", screen["detail"])
+
+    def test_remove_device_deletes_files_and_cache(self):
+        obj, tmp = self.make()
+        camera_model = os.path.join(tmp, "cameras", "cam-a.npz")
+        screen_profile = os.path.join(tmp, "screens", "scr-a.json")
+        sample = os.path.join(tmp, "samples", "cam-a__scr-a.npz")
+        os.makedirs(os.path.dirname(camera_model), exist_ok=True)
+        os.makedirs(os.path.dirname(screen_profile), exist_ok=True)
+        for path in (camera_model, screen_profile, sample):
+            open(path, "w").close()
+
+        obj._remove_device("camera", "cam-a")
+        self.assertNotIn("cam-a", obj.devices_registry["cameras"])
+        self.assertFalse(os.path.exists(camera_model))
+        self.assertFalse(os.path.exists(sample))
+        self.assertNotIn("cam-a", obj.camera_models)
+        self.assertEqual(obj.available_cameras, [])
+
+        obj._remove_device("screen", "scr-a")
+        self.assertNotIn("scr-a", obj.devices_registry["screens"])
+        self.assertFalse(os.path.exists(screen_profile))
+        self.assertNotIn("scr-a", obj.screen_states)
+        self.assertIsNone(obj.active_screen_id)
+
+
 if __name__ == "__main__":
     unittest.main()

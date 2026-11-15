@@ -117,6 +117,21 @@ class CameraSelectionTest(unittest.TestCase):
         self.assertIsNone(devices.choose_default_camera([]))
 
 
+class ConnectionNameTest(unittest.TestCase):
+    def test_known_connections(self):
+        self.assertEqual(devices._connection_name(5), "HDMI")
+        self.assertEqual(devices._connection_name(10), "DisplayPort")
+        self.assertEqual(devices._connection_name(4), "DVI")
+
+    def test_internal_accepts_signed_and_unsigned(self):
+        self.assertEqual(devices._connection_name(0x80000000), "内置屏")
+        self.assertEqual(devices._connection_name(-2147483648), "内置屏")
+
+    def test_unknown_and_missing(self):
+        self.assertEqual(devices._connection_name(None), "")
+        self.assertIn("未知", devices._connection_name(999))
+
+
 class EdidTest(unittest.TestCase):
     """EDID 解析与屏幕参数档案（HDMI 屏建档用）。"""
 

@@ -1,9 +1,10 @@
+import glob
 import os
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 import pystray
 import numpy as np
@@ -123,7 +124,9 @@ class BrightnessManagerApp:
         # 创建主窗口
         self.root = tk.Tk()
         self.root.title("亮度管理器")
-        self.root.geometry("700x1000")
+        # 固定一个能放下四个页签的窗口尺寸；内容更宽时用滚动条，不再自动扩大窗口
+        self.root.geometry("760x620")
+        self.root.minsize(640, 480)
         self.root.resizable(True, True)
         
         # 设置窗口图标
@@ -215,109 +218,194 @@ class BrightnessManagerApp:
         # 注意：自动调整定时任务将在模型加载完成后启动
     
     def create_gui(self):
-        """创建GUI界面"""
-        # 创建主框架
+        """创建 GUI：分页布局，避免所有控件挤在一页里放不下"""
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 创建信息展示文本框
-        info_frame = ttk.LabelFrame(main_frame, text="系统状态", padding="10")
-        info_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # 设置文本框字体大小
-        self.info_text = tk.Text(info_frame, height=10, wrap=tk.WORD, font=("Microsoft YaHei", 11))
-        self.info_text.pack(fill=tk.BOTH, expand=True)
-        self.info_text.config(state=tk.DISABLED)
-        
-        # 创建亮度控制框架
-        brightness_frame = ttk.LabelFrame(main_frame, text="亮度控制", padding="10")
-        brightness_frame.pack(fill=tk.X, pady=5)
-        
-        # 当前屏幕选择（手动调节只作用于这一块屏）
-        screen_row = ttk.Frame(brightness_frame)
-        screen_row.pack(fill=tk.X, pady=2)
-        ttk.Label(screen_row, text="当前屏幕:").pack(side=tk.LEFT, padx=5)
+
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self._build_brightness_tab()
+        self._build_devices_tab()
+        self._build_settings_tab()
+        self._build_log_tab()
+
+        # 所有标签页的控件都建好后再刷新，避免刷新回调找不到控件
+        self.refresh_camera_list()
+        self.refresh_monitor_list()
+        self._refresh_device_info()
+
+        # 测试通知位置
+        show_notification("通知将在此处展示", position=self.notification_position, level='info')
+
+    def _build_brightness_tab(self):
+        """亮度页：当前屏幕、滑条、四个操作按钮"""
+        tab = ttk.Frame(self.notebook, padding="14")
+        self.notebook.add(tab, text=" 亮度 ")
+
+        ttk.Label(tab, text="当前屏幕", font=("Microsoft YaHei", 11, "bold")).pack(anchor=tk.W)
+
+        screen_row = ttk.Frame(tab)
+        screen_row.pack(fill=tk.X, pady=(6, 2))
         self.screen_var = tk.StringVar()
         self.screen_combo = ttk.Combobox(
             screen_row,
             textvariable=self.screen_var,
             state="readonly",
-            width=32
+            width=34
         )
-        self.screen_combo.pack(side=tk.LEFT, padx=5)
+        self.screen_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.screen_combo.bind("<<ComboboxSelected>>", self.on_screen_change)
-        
-        # 当前屏幕的支持状态（WMI / DDC / 不支持）
-        self.screen_status_label = ttk.Label(brightness_frame, text="", foreground="gray")
-        self.screen_status_label.pack(anchor=tk.W, padx=5)
-        
-        # 创建亮度滑动条
+
+        self.screen_status_label = ttk.Label(tab, text="", foreground="gray")
+        self.screen_status_label.pack(anchor=tk.W, pady=(2, 12))
+
+        scale_row = ttk.Frame(tab)
+        scale_row.pack(fill=tk.X, pady=(4, 12))
         self.brightness_var = tk.IntVar(value=self.current_brightness)
         brightness_scale = ttk.Scale(
-            brightness_frame, 
-            from_=0, 
-            to=100, 
-            orient=tk.HORIZONTAL, 
+            scale_row,
+            from_=0,
+            to=100,
+            orient=tk.HORIZONTAL,
             variable=self.brightness_var,
             command=self.on_brightness_change
         )
-        brightness_scale.pack(fill=tk.X, pady=5)
-        
-        # 创建亮度值标签
-        self.brightness_label = ttk.Label(brightness_frame, text=f"亮度: {self.current_brightness}%")
-        self.brightness_label.pack()
-        
-        # 创建按钮框架
-        button_frame = ttk.Frame(brightness_frame)
-        button_frame.pack(fill=tk.X, pady=5)
+        brightness_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.brightness_label = ttk.Label(
+            scale_row,
+            text=f"亮度: {self.current_brightness}%",
+            width=9,
+            anchor=tk.E
+        )
+        self.brightness_label.pack(side=tk.LEFT, padx=(10, 0))
 
-        # 创建获取亮度按钮
-        get_brightness_button = ttk.Button(button_frame, text="获取亮度", command=self.on_get_brightness_click)
-        get_brightness_button.pack(side=tk.LEFT, padx=5)
+        button_frame = ttk.Frame(tab)
+        button_frame.pack(fill=tk.X, pady=(2, 10))
+        ttk.Button(button_frame, text="获取亮度", command=self.on_get_brightness_click).grid(
+            row=0, column=0, padx=(0, 6), pady=4, sticky="ew"
+        )
+        ttk.Button(button_frame, text="应用", command=self.apply_brightness).grid(
+            row=0, column=1, padx=(0, 6), pady=4, sticky="ew"
+        )
+        ttk.Button(button_frame, text="训练当前屏", command=self.train_current_screen).grid(
+            row=1, column=0, padx=(0, 6), pady=4, sticky="ew"
+        )
+        ttk.Button(button_frame, text="训练全部勾选屏", command=self.train_all_screens).grid(
+            row=1, column=1, padx=(0, 6), pady=4, sticky="ew"
+        )
+        button_frame.columnconfigure(0, weight=1)
+        button_frame.columnconfigure(1, weight=1)
 
-        # 创建应用按钮（只写当前屏，不生成样本）
-        apply_button = ttk.Button(button_frame, text="应用", command=self.apply_brightness)
-        apply_button.pack(side=tk.LEFT, padx=5)
+        ttk.Label(
+            tab,
+            text="「获取亮度」只计算建议值；「应用」只写当前屏；训练会记录样本并更新这块屏的曲线。"
+                 "多屏时先在「设备」页勾选参与自动调节的屏幕。",
+            foreground="gray",
+            wraplength=680,
+            justify=tk.LEFT
+        ).pack(fill=tk.X, pady=(2, 12))
 
-        # 训练当前屏：记当前屏一条样本并拟合它的曲线
-        train_current_button = ttk.Button(button_frame, text="训练当前屏", command=self.train_current_screen)
-        train_current_button.pack(side=tk.LEFT, padx=5)
-
-        # 训练全部勾选屏：每块参与自动调节的屏各记一条，再拟合
-        train_all_button = ttk.Button(button_frame, text="训练全部勾选屏", command=self.train_all_screens)
-        train_all_button.pack(side=tk.LEFT, padx=5)
-        
-        # 创建模型加载状态标签
         self.model_status_label = ttk.Label(
-            brightness_frame, 
-            text="模型状态: 加载中...", 
+            tab,
+            text="模型状态: 加载中...",
             foreground="orange"
         )
-        self.model_status_label.pack(pady=5)
-        
-        # 创建设置框架
-        settings_frame = ttk.LabelFrame(main_frame, text="设置", padding="10")
-        settings_frame.pack(fill=tk.X, pady=5)
-        
-        # 创建开机自启动勾选框
+        self.model_status_label.pack(anchor=tk.W)
+
+    def _build_devices_tab(self):
+        """设备页：摄像头选择、参与自动调节的屏幕、已登记设备"""
+        tab = ttk.Frame(self.notebook, padding="14")
+        self.notebook.add(tab, text=" 设备 ")
+
+        camera_frame = ttk.LabelFrame(tab, text="摄像头", padding="8")
+        camera_frame.pack(fill=tk.X, pady=(0, 10))
+        camera_row = ttk.Frame(camera_frame)
+        camera_row.pack(fill=tk.X)
+        self.camera_var = tk.StringVar()
+        self.camera_combo = ttk.Combobox(
+            camera_row,
+            textvariable=self.camera_var,
+            state="readonly",
+            width=30
+        )
+        self.camera_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.camera_combo.bind("<<ComboboxSelected>>", self.on_camera_change)
+        ttk.Button(camera_row, text="刷新", command=self.on_refresh_cameras).pack(side=tk.LEFT, padx=(8, 0))
+
+        monitor_frame = ttk.LabelFrame(tab, text="显示器（勾选 = 参与自动调节）", padding="8")
+        monitor_frame.pack(fill=tk.X, pady=(0, 10))
+        self.monitor_checkboxes_frame = ttk.Frame(monitor_frame)
+        self.monitor_checkboxes_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.monitor_vars = {}
+        ttk.Button(monitor_frame, text="刷新", command=self.on_refresh_monitors).pack(
+            side=tk.LEFT, padx=(8, 0), anchor=tk.N
+        )
+
+        registered_frame = ttk.LabelFrame(tab, text="已登记设备", padding="8")
+        registered_frame.pack(fill=tk.BOTH, expand=True)
+
+        toolbar = ttk.Frame(registered_frame)
+        toolbar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(toolbar, text="刷新", command=self._refresh_device_info).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="删除选中", command=self._delete_selected_devices).pack(side=tk.LEFT, padx=(8, 0))
+
+        tree_frame = ttk.Frame(registered_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        # 合并「训练/样本」到状态列，去掉 ID 列：4 列在常见缩放下都能完整显示
+        columns = ("type", "name", "status", "detail")
+        self.device_tree = ttk.Treeview(
+            tree_frame,
+            columns=columns,
+            show="headings",
+            height=7,
+            selectmode="extended"
+        )
+        headings = {
+            "type": "类型", "name": "名称", "status": "状态", "detail": "详情",
+        }
+        for column in columns:
+            self.device_tree.heading(column, text=headings[column])
+            self.device_tree.column(column, width=80, minwidth=50, anchor=tk.W)
+
+        # 行高跟随字体，避免高 DPI 下文字被上下裁掉
+        try:
+            import tkinter.font as tkfont
+            default_font = tkfont.nametofont("TkDefaultFont")
+            ttk.Style().configure("Treeview", rowheight=default_font.metrics("linespace") + 8)
+        except Exception:
+            pass
+
+        device_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.device_tree.yview)
+        device_hscroll = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.device_tree.xview)
+        self.device_tree.configure(
+            yscrollcommand=device_scroll.set,
+            xscrollcommand=device_hscroll.set
+        )
+        self.device_tree.grid(row=0, column=0, sticky="nsew")
+        device_scroll.grid(row=0, column=1, sticky="ns")
+        device_hscroll.grid(row=1, column=0, sticky="ew")
+        self.device_tree.tag_configure("offline", foreground="gray")
+
+    def _build_settings_tab(self):
+        """设置页：开机自启、检查间隔、通知位置"""
+        tab = ttk.Frame(self.notebook, padding="14")
+        self.notebook.add(tab, text=" 设置 ")
+
         self.startup_var = tk.BooleanVar(value=self.startup_enabled)
-        startup_check = ttk.Checkbutton(
-            settings_frame, 
-            text="开机自启动", 
+        ttk.Checkbutton(
+            tab,
+            text="开机自启动",
             variable=self.startup_var,
             command=self.on_startup_change
-        )
-        startup_check.pack(anchor=tk.W)
-        
-        # 创建循环检查间隔框架
-        interval_frame = ttk.Frame(settings_frame)
-        interval_frame.pack(fill=tk.X, pady=5)
-        
-        # 创建间隔标签
-        interval_label = ttk.Label(interval_frame, text="循环检查间隔:")
-        interval_label.pack(side=tk.LEFT, padx=5)
-        
-        # 定义间隔选项（秒数，显示文本）
+        ).pack(anchor=tk.W, pady=(0, 12))
+
+        interval_row = ttk.Frame(tab)
+        interval_row.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(interval_row, text="循环检查间隔:").pack(side=tk.LEFT)
         self.interval_options = [
             (60, "1分钟"),
             (120, "2分钟"),
@@ -332,166 +420,266 @@ class BrightnessManagerApp:
             (43200, "12小时"),
             (86400, "24小时")
         ]
-        
-        # 创建间隔下拉框
         self.interval_var = tk.StringVar()
         interval_combo = ttk.Combobox(
-            interval_frame,
+            interval_row,
             textvariable=self.interval_var,
             values=[text for _, text in self.interval_options],
             state="readonly",
             width=10
         )
-        interval_combo.pack(side=tk.LEFT, padx=5)
-        
-        # 设置当前值
+        interval_combo.pack(side=tk.LEFT, padx=8)
+
         current_interval_text = "5分钟"
         for seconds, text in self.interval_options:
             if seconds == self.check_interval:
                 current_interval_text = text
                 break
         self.interval_var.set(current_interval_text)
-        
-        # 绑定选择事件
         interval_combo.bind("<<ComboboxSelected>>", self.on_interval_change)
-        
-        # 创建摄像头选择框架
-        camera_frame = ttk.Frame(settings_frame)
-        camera_frame.pack(fill=tk.X, pady=5)
-        
-        # 创建摄像头选择标签
-        camera_label = ttk.Label(camera_frame, text="摄像头选择:")
-        camera_label.pack(side=tk.LEFT, padx=5)
-        
-        # 创建摄像头下拉框（单选）
-        self.camera_var = tk.StringVar()
-        self.camera_combo = ttk.Combobox(
-            camera_frame,
-            textvariable=self.camera_var,
-            state="readonly",
-            width=20
-        )
-        self.camera_combo.pack(side=tk.LEFT, padx=5)
-        
-        # 绑定摄像头选择变化事件
-        self.camera_combo.bind("<<ComboboxSelected>>", self.on_camera_change)
-        
-        # 创建刷新摄像头列表按钮
-        refresh_camera_button = ttk.Button(
-            camera_frame,
-            text="刷新",
-            command=self.on_refresh_cameras
-        )
-        refresh_camera_button.pack(side=tk.LEFT, padx=5)
-        
-        # 初始化摄像头列表
-        self.refresh_camera_list()
-        
-        # 创建设备选择框架
-        monitor_frame = ttk.Frame(settings_frame)
-        monitor_frame.pack(fill=tk.X, pady=5)
-        
-        # 创建显示器选择标签
-        monitor_label = ttk.Label(monitor_frame, text="显示器选择:")
-        monitor_label.pack(side=tk.LEFT, padx=5)
-        
-        # 创建显示器复选框框架
-        self.monitor_checkboxes_frame = ttk.Frame(monitor_frame)
-        self.monitor_checkboxes_frame.pack(side=tk.LEFT, padx=5)
-        
-        # 存储显示器复选框变量
-        self.monitor_vars = {}
-        
-        # 创建刷新显示器列表按钮
-        refresh_monitor_button = ttk.Button(
-            monitor_frame,
-            text="刷新",
-            command=self.on_refresh_monitors
-        )
-        refresh_monitor_button.pack(side=tk.LEFT, padx=5)
-        
-        # 初始化显示器列表
-        self.refresh_monitor_list()
-        
-        # 创建通知位置选择框架
-        notification_position_frame = ttk.Frame(settings_frame)
-        notification_position_frame.pack(fill=tk.X, pady=5)
-        
-        # 创建通知位置选择标签
-        notification_position_label = ttk.Label(notification_position_frame, text="通知显示位置:")
-        notification_position_label.pack(side=tk.LEFT, padx=5)
-        
-        # 获取保存的通知位置配置
+
+        position_row = ttk.Frame(tab)
+        position_row.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(position_row, text="通知显示位置:").pack(side=tk.LEFT)
         self.notification_position = config_manager.get('notification_position', 'bottom')
-        
-        # 创建通知位置下拉框
         self.notification_position_var = tk.StringVar()
-        notification_position_combo = ttk.Combobox(
-            notification_position_frame,
+        notification_combo = ttk.Combobox(
+            position_row,
             textvariable=self.notification_position_var,
             values=["右下", "顶部"],
             state="readonly",
             width=10
         )
-        notification_position_combo.pack(side=tk.LEFT, padx=5)
-        
-        # 设置当前值
+        notification_combo.pack(side=tk.LEFT, padx=8)
         self.notification_position_var.set("右下" if self.notification_position == 'bottom' else "顶部")
-        
-        # 绑定选择事件
-        notification_position_combo.bind("<<ComboboxSelected>>", self.on_notification_position_change)
-        # 测试通知位置
-        show_notification("通知将在此处展示", position=self.notification_position, level='info')
-        
-        # 已登记设备信息（摄像头 / 屏幕 / 是否训练过）
-        device_info_frame = ttk.LabelFrame(main_frame, text="已登记设备", padding="10")
-        device_info_frame.pack(fill=tk.BOTH, expand=False, pady=5)
-        self.device_info_text = tk.Text(
-            device_info_frame,
-            height=6,
+        notification_combo.bind("<<ComboboxSelected>>", self.on_notification_position_change)
+
+        ttk.Separator(tab, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=12)
+        ttk.Label(
+            tab,
+            text="提示：摄像头与显示器列表在「设备」页刷新；亮度训练与手动调节在「亮度」页。",
+            foreground="gray",
+            wraplength=680,
+            justify=tk.LEFT
+        ).pack(anchor=tk.W)
+
+    def _build_log_tab(self):
+        """日志页：运行日志单独一页，避免挤占操作区"""
+        tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(tab, text=" 日志 ")
+
+        log_frame = ttk.Frame(tab)
+        log_frame.pack(fill=tk.BOTH, expand=True)
+        self.info_text = tk.Text(
+            log_frame,
+            height=20,
             wrap=tk.WORD,
             font=("Microsoft YaHei", 10)
         )
-        self.device_info_text.pack(fill=tk.BOTH, expand=True)
-        self.device_info_text.config(state=tk.DISABLED)
-        self._refresh_device_info()
-    
-    def _refresh_device_info(self):
-        """把 devices.json 里的登记情况显示到界面"""
-        if not hasattr(self, 'device_info_text'):
-            return
-        lines = []
-        cameras = self.devices_registry.get('cameras', {})
-        screens = self.devices_registry.get('screens', {})
-        for camera_id, entry in cameras.items():
-            trained = '是' if entry.get('trained') else '否'
-            connected = '' if entry.get('connected', True) else '（未接入）'
-            lines.append(
-                f"摄像头  {entry.get('name', '?')}{connected}  "
-                f"训练:{trained}  样本:{entry.get('sample_count', 0)}  [{camera_id}]"
-            )
-        for screen_id, entry in screens.items():
-            trained = '是' if entry.get('trained') else '否'
-            connected = '' if entry.get('connected', True) else '（未接入）'
+        log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.info_text.yview)
+        self.info_text.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.info_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.info_text.config(state=tk.DISABLED)
+
+    def _device_rows(self):
+        """把 devices.json 转成表格行（纯数据，便于测试）"""
+        rows = []
+        for camera_id, entry in (self.devices_registry.get('cameras') or {}).items():
+            rows.append({
+                'kind': 'camera',
+                'id': camera_id,
+                'type': '摄像头',
+                'name': entry.get('name') or '?',
+                'status': '已接入' if entry.get('connected', True) else '未接入',
+                'trained': '是' if entry.get('trained') else '否',
+                'samples': entry.get('sample_count', 0),
+                'detail': entry.get('resolution') or entry.get('id_source') or '',
+            })
+        for screen_id, entry in (self.devices_registry.get('screens') or {}).items():
             params = entry.get('params') or {}
-            detail = []
-            if params.get('connection'):
-                detail.append(str(params['connection']))
+            detail_parts = []
+            connection = str(params.get('connection') or '')
+            if connection and not connection.startswith('未知('):
+                detail_parts.append(connection)
             if params.get('resolution'):
-                detail.append(str(params['resolution']))
+                detail_parts.append(str(params['resolution']))
             if params.get('size_cm'):
-                detail.append(f"{params['size_cm']}cm")
-            detail_text = ('  ' + ' '.join(detail)) if detail else ''
-            lines.append(
-                f"屏幕    {entry.get('name', '?')}{connected}{detail_text}  "
-                f"训练:{trained}  样本:{entry.get('sample_count', 0)}  [{screen_id}]"
+                detail_parts.append(f"{params['size_cm']}cm")
+            if not detail_parts and params.get('backend'):
+                detail_parts.append(str(params['backend']))
+            rows.append({
+                'kind': 'screen',
+                'id': screen_id,
+                'type': '屏幕',
+                'name': entry.get('name') or '?',
+                'status': '已接入' if entry.get('connected', True) else '未接入',
+                'trained': '是' if entry.get('trained') else '否',
+                'samples': entry.get('sample_count', 0),
+                'detail': ' '.join(detail_parts),
+            })
+        return rows
+
+    def _refresh_device_info(self):
+        """把 devices.json 里的登记情况渲染成表格"""
+        if not hasattr(self, 'device_tree'):
+            return
+        for item in self.device_tree.get_children():
+            self.device_tree.delete(item)
+        for row in self._device_rows():
+            trained_text = '已训练' if row['trained'] == '是' else '未训练'
+            status_text = f"{row['status']} · {trained_text} · {row['samples']}条"
+            self.device_tree.insert(
+                '',
+                tk.END,
+                iid=f"{row['kind']}:{row['id']}",
+                values=(
+                    row['type'], row['name'], status_text, row['detail'],
+                ),
+                tags=() if row['status'] == '已接入' else ('offline',)
             )
-        if not lines:
-            lines = ["（尚未登记设备）"]
-        self.device_info_text.config(state=tk.NORMAL)
-        self.device_info_text.delete('1.0', tk.END)
-        self.device_info_text.insert(tk.END, "\n".join(lines))
-        self.device_info_text.config(state=tk.DISABLED)
+        self._autosize_device_columns()
+
+    def _autosize_device_columns(self):
+        """按字体实际宽度调整列宽，避免高 DPI 或长名称被截断"""
+        if not hasattr(self, 'device_tree'):
+            return
+        try:
+            import tkinter.font as tkfont
+            font = tkfont.nametofont("TkDefaultFont")
+        except Exception:
+            font = None
+
+        minimum = {"type": 56, "name": 150, "status": 150, "detail": 160}
+        rows = [self.device_tree.item(item, "values") for item in self.device_tree.get_children()]
+        for index, column in enumerate(self.device_tree["columns"]):
+            texts = [self.device_tree.heading(column, "text")]
+            texts.extend(str(row[index]) for row in rows if index < len(row))
+            if font is not None:
+                measured = max(font.measure(str(text)) for text in texts)
+            else:
+                measured = max(len(str(text)) for text in texts) * 8
+            width = max(measured + 28, minimum.get(column, 60))
+            # minwidth 取内容宽度：窗口变窄时列不会再被压缩到截断，而是出现水平滚动条；
+            # 窗口变宽时 name/detail 可以伸展填满
+            self.device_tree.column(
+                column,
+                width=width,
+                minwidth=width,
+                stretch=column in ("name", "detail")
+            )
+
+    def _device_files(self, kind, device_id):
+        """设备对应的模型/曲线/样本文件路径"""
+        root = self.data_root
+        paths = []
+        if kind == 'camera':
+            paths.append(os.path.join(root, 'cameras', f'{device_id}.npz'))
+            paths.extend(glob.glob(os.path.join(root, 'samples', f'{device_id}__*.npz')))
+        else:
+            paths.append(os.path.join(root, 'screens', f'{device_id}.json'))
+            paths.extend(glob.glob(os.path.join(root, 'samples', f'*__{device_id}.npz')))
+        return paths
+
+    def _remove_device(self, kind, device_id):
+        """从登记、内存缓存和磁盘里移除一个设备"""
+        section = 'cameras' if kind == 'camera' else 'screens'
+        self.devices_registry.get(section, {}).pop(device_id, None)
+        for path in self._device_files(kind, device_id):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if kind == 'camera':
+            self.camera_models.pop(device_id, None)
+            self.available_cameras = [
+                camera for camera in self.available_cameras
+                if camera.get('camera_id') != device_id
+            ]
+            if config_manager.get('selected_camera_id') == device_id:
+                config_manager.set('selected_camera_id', None)
+        else:
+            self.screen_curves.pop(device_id, None)
+            self.screen_states.pop(device_id, None)
+            self.available_monitors = [
+                screen for screen in self.available_monitors
+                if screen.get('id') != device_id
+            ]
+            if self.active_screen_id == device_id:
+                self.active_screen_id = None
+                config_manager.set('active_screen_id', None)
+            selected = [
+                sid for sid in (config_manager.get('selected_screen_ids') or [])
+                if sid != device_id
+            ]
+            config_manager.set('selected_screen_ids', selected)
+
+    def _delete_selected_devices(self):
+        """删除表格里选中的设备记录（含模型/曲线/样本文件）"""
+        if not hasattr(self, 'device_tree'):
+            return
+        selection = self.device_tree.selection()
+        if not selection:
+            show_window_notification(
+                "请先在表格里选择要删除的设备",
+                position=self.notification_position,
+                level='warning'
+            )
+            return
+
+        names = []
+        for item in selection:
+            values = self.device_tree.item(item, 'values')
+            names.append(values[1] if values else item)
+        message = (
+            "确定删除以下设备记录？\n\n" + "\n".join(names) +
+            "\n\n会同时删除对应的模型/曲线和样本文件。\n"
+            "已接入的设备在下次刷新时会重新登记。"
+        )
+        try:
+            confirmed = messagebox.askyesno("删除设备", message, parent=self.root)
+        except Exception:
+            confirmed = False
+        if not confirmed:
+            return
+
+        removed = 0
+        for item in selection:
+            kind, _, device_id = item.partition(':')
+            if kind not in ('camera', 'screen') or not device_id:
+                continue
+            self._remove_device(kind, device_id)
+            removed += 1
+
+        try:
+            devices.save_registry(self.devices_registry_path, self.devices_registry)
+        except Exception as exc:
+            self.log_warning(f"保存设备登记失败: {exc}")
+
+        self._refresh_device_info()
+        self._rebuild_monitor_checkboxes()
+        self._refresh_screen_combo()
+
+        camera_names = [camera['name'] for camera in self.available_cameras]
+        self.camera_combo['values'] = camera_names
+        if self.camera_var.get() not in camera_names:
+            if camera_names:
+                camera = self.available_cameras[0]
+                self.camera_var.set(camera['name'])
+                config_manager.set('selected_camera_id', camera['camera_id'])
+                config_manager.set('selected_camera_name', camera['name'])
+            else:
+                self.camera_var.set('')
+                config_manager.set('selected_camera_id', None)
+
+        if removed:
+            self.log_info(f"已删除 {removed} 个设备记录")
+            show_window_notification(
+                f"已删除 {removed} 个设备记录",
+                position=self.notification_position,
+                level='success'
+            )
+
     def on_notification_position_change(self, event):
         """处理通知位置选择变化"""
         selected_text = self.notification_position_var.get()
@@ -510,7 +698,9 @@ class BrightnessManagerApp:
         """在后台线程中加载当前摄像头的模型"""
         self.model_loading = True
         self.log_info("正在后台加载神经网络模型...")
-        threading.Thread(target=self._load_model_in_background, daemon=True).start()
+        # 在主线程先取好摄像头，避免后台线程访问 Tk 变量
+        camera = self._active_camera()
+        threading.Thread(target=self._load_model_in_background, args=(camera,), daemon=True).start()
 
     def _prior_model_paths(self):
         """打包/用户目录里可用的相机先验模型路径"""
@@ -582,10 +772,11 @@ class BrightnessManagerApp:
         brightness = int(round(float(np.clip(self.get_screen_curve(screen_id).evaluate(reference), 0, 100))))
         return brightness, reference
 
-    def _load_model_in_background(self):
-        """后台加载当前摄像头的模型（设备列表已在 create_gui 里刷新过）"""
+    def _load_model_in_background(self, camera=None):
+        """后台加载当前摄像头的模型（摄像头在主线程取好传进来）"""
         try:
-            camera = self._active_camera()
+            if camera is None:
+                camera = self._active_camera()
             if camera:
                 self.get_camera_model(camera.get('camera_id'))
                 self.log_info(f"已加载摄像头模型：{camera.get('name')}")
@@ -598,23 +789,30 @@ class BrightnessManagerApp:
             self.model_loaded = True
             self.root.after(0, self._on_model_loaded)
 
+    def _set_model_status(self, text, color):
+        """更新模型状态标签（主线程调用）"""
+        if not hasattr(self, 'model_status_label'):
+            return
+        try:
+            self.model_status_label.config(text=text, foreground=color)
+        except Exception:
+            pass
+
     def _on_model_loaded(self):
         """模型加载完成后的回调（在主线程中执行）"""
         if self.nn:
             self.log_info("神经网络模型加载完成")
             show_startup_notification("神经网络模型加载完成", level='success')
-            self.model_status_label.config(
-                text="模型状态: 已加载",
-                foreground="green"
-            )
+            self._set_model_status("模型状态: 已加载", "green")
             self._update_screen_status()
+        elif self._active_camera() is None:
+            # 没有选摄像头（例如上次用的摄像头未接入）不是加载失败，等用户选择即可
+            self.log_warning("尚未选择摄像头，模型暂未加载")
+            self._set_model_status("模型状态: 未选择摄像头", "orange")
         else:
             self.log_error("神经网络模型加载失败")
             show_startup_notification("神经网络模型加载失败，部分功能可能不可用", level='error')
-            self.model_status_label.config(
-                text="模型状态: 加载失败",
-                foreground="red"
-            )
+            self._set_model_status("模型状态: 加载失败", "red")
         
         # 如果自动亮度调整已启用，启动定时任务
         if self.auto_brightness_enabled and self.nn:
@@ -700,16 +898,19 @@ class BrightnessManagerApp:
     # ------------------------------------------------------------------
 
     def _active_camera(self):
-        """当前选中的摄像头（严格匹配，未选择或已断开时返回 None）"""
+        """当前选中的摄像头（严格匹配，未选择或已断开时返回 None）
+
+        只读配置，不碰 Tk 变量：这个方法会被后台线程（采集/自动调整）调用。
+        """
         if not self.available_cameras:
             return None
         saved_id = config_manager.get('selected_camera_id')
-        selected_name = self.camera_var.get() if hasattr(self, 'camera_var') else ''
+        saved_name = config_manager.get('selected_camera_name')
         for camera in self.available_cameras:
             if saved_id and camera.get('camera_id') == saved_id:
                 return camera
         for camera in self.available_cameras:
-            if selected_name and camera.get('name') == selected_name:
+            if saved_name and camera.get('name') == saved_name:
                 return camera
         return None
 
@@ -1140,6 +1341,8 @@ class BrightnessManagerApp:
                 predicted, reference = predictions[screen['id']]
                 self.current_brightness = predicted
                 self.root.after(0, lambda v=predicted: self._show_predicted(v))
+                if self.nn:
+                    self.root.after(0, lambda: self._set_model_status("模型状态: 已加载", "green"))
                 self.log_info(f"当前环境亮度（参考）: {reference}")
                 self.log_info(f"神经网络推荐亮度: {predicted}%")
         except Exception as e:
@@ -1541,9 +1744,11 @@ class BrightnessManagerApp:
         try:
             self.get_camera_model(camera['camera_id'])
             self.log_info(f"已切换到摄像头模型：{camera['name']}")
+            self.root.after(0, lambda: self._set_model_status("模型状态: 已加载", "green"))
             self.root.after(0, lambda: self._update_screen_status())
         except Exception as e:
             self.log_error(f"切换摄像头模型失败: {e}")
+            self.root.after(0, lambda: self._set_model_status("模型状态: 加载失败", "red"))
     
     def on_monitor_change(self, screen_id=None):
         """显示器勾选变化：勾选 = 参与自动调节"""
