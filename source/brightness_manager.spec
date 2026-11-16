@@ -7,10 +7,6 @@ datas = [
     ('favicon.ico', '.'),
     ('brightness_model.npz', '.'),
     ('config.json', '.'),
-    ('liangdu.py', '.'),
-    ('config.py', '.'),
-    ('notification.py', '.'),
-    ('utils.py', '.'),
 ]
 
 # 配置
@@ -58,14 +54,12 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# 创建exe配置
+# 创建exe配置（目录版：exe 只带脚本，依赖放在 _internal）
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='BrightnessManager',
     debug=False,
     bootloader_ignore_signals=False,
@@ -86,7 +80,6 @@ exe = EXE(
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
     strip=False,
     upx=True,

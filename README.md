@@ -75,24 +75,27 @@ python source/app.py
 
 ### 打包为可执行文件
 
-单文件版本（启动时解压到 `%TEMP%`，体积小、便于分发）：
+单文件版本（启动时解压到 `%TEMP%`，便于分发）：
 
 ```bash
-pyinstaller source/app.spec
+cd source
+pyinstaller app.spec
+# 产物：source/dist/app.exe
 ```
 
 目录版本（不解压、启动快，部分安全软件会拦截单文件版解压时优先用这个）：
 
 ```bash
 cd source
-pyinstaller --onedir --windowed --name Light --icon favicon.ico ^
-  --add-data "favicon.ico;." --add-data "brightness_model.npz;." --add-data "config.json;." ^
-  app.py
+pyinstaller brightness_manager.spec
+# 产物：source/dist/BrightnessManager/BrightnessManager.exe + _internal/
 ```
 
 > PyInstaller 6.x 会把 `--onedir` 的资源放进 `_internal/`，程序已按
 > `用户数据目录 → exe 同级目录 → 打包资源目录` 的顺序查找模型和配置，
 > 两种打包方式都能读到自带的 `brightness_model.npz` / `config.json`。
+> 两个 spec 都已包含 `devices.py` / `models.py`（自动跟随 import）和
+> `comtypes` 的 hiddenimports，不需要额外参数。
 
 ### 运行时文件位置
 
