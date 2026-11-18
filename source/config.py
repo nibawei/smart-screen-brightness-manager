@@ -69,7 +69,8 @@ class ConfigManager:
             'selected_screen_ids': [],  # 参与自动调节的屏幕 ID 列表
             'active_screen_id': None,  # 当前手动调节的屏幕 ID
             'manual_screen_ids': [],  # 用户手动设置过亮度的屏幕 ID 列表
-            'notification_position': 'bottom'  # 通知显示位置：'top'（顶部）或 'bottom'（右下）
+            'notification_position': 'bottom',  # 通知显示位置：'top'（顶部）或 'bottom'（右下）
+            'show_tray_hint': True  # 关闭主界面时是否提示「可在托盘重新打开」
         }
         self.config = self.load_config()
     

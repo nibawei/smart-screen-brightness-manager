@@ -5,6 +5,9 @@ import winreg
 
 class SystemUtils:
     """系统工具类，提供系统相关的工具函数"""
+
+    #: 开机自启动时附加的命令行参数，用来区分「自启动」和「用户自己打开 exe」
+    AUTOSTART_ARG = '--autostart'
     
     @staticmethod
     def show_notification(title, message, duration=5):
@@ -42,8 +45,10 @@ class SystemUtils:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE)
             
             if enable:
-                # 设置开机自启动
-                winreg.SetValueEx(key, script_name, 0, winreg.REG_SZ, script_path)
+                # 设置开机自启动（带 --autostart，程序据此决定要不要弹主界面）
+                winreg.SetValueEx(
+                    key, script_name, 0, winreg.REG_SZ,
+                    SystemUtils.build_startup_command(script_path))
             else:
                 # 移除开机自启动
                 try:
@@ -58,6 +63,27 @@ class SystemUtils:
             print(f"设置开机自启动失败: {e}")
             return False
     
+    @staticmethod
+    def build_startup_command(script_path):
+        """开机自启注册表里写的命令行（路径加引号，并带上 --autostart）"""
+        return f'"{script_path}" {SystemUtils.AUTOSTART_ARG}'
+
+    @staticmethod
+    def parse_startup_command(value):
+        """从注册表命令行里取出 exe 路径，去掉引号和 --autostart
+
+        兼容老版本写入的「纯路径」格式，避免升级后自启动状态被误判为关闭。
+        """
+        text = str(value or '').strip()
+        if text.startswith('"'):
+            end = text.find('"', 1)
+            if end > 1:
+                return text[1:end]
+        suffix = ' ' + SystemUtils.AUTOSTART_ARG
+        if text.endswith(suffix):
+            return text[:-len(suffix)]
+        return text
+
     @staticmethod
     def get_startup():
         """获取开机自启动状态
@@ -77,8 +103,9 @@ class SystemUtils:
             # 尝试获取值
             try:
                 value, _ = winreg.QueryValueEx(key, script_name)
-                # 检查值是否正确
-                result = value == script_path
+                # 注册表里可能是 "路径" --autostart，比较时只比路径
+                recorded = SystemUtils.parse_startup_command(value)
+                result = os.path.normcase(os.path.abspath(recorded)) == os.path.normcase(script_path)
             except FileNotFoundError:
                 # 如果值不存在，返回False
                 result = False

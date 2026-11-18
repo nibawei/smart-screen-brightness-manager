@@ -138,6 +138,10 @@ class BrightnessManagerApp:
             # 忽略图标加载错误，确保程序能正常运行
             print(f"加载窗口图标失败: {e}")
         
+        # 启动方式：开机自启动（注册表命令里带 --autostart）时只留托盘，
+        # 用户自己双击 exe 时直接把主界面显示出来
+        self.started_by_autostart = SystemUtils.AUTOSTART_ARG in sys.argv
+
         # 绑定窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
         
@@ -164,6 +168,10 @@ class BrightnessManagerApp:
         self.check_interval = config_manager.get('check_interval', 300)  # 循环检查间隔（秒）
         # 获取实际的开机自启动状态
         self.startup_enabled = SystemUtils.get_startup()
+        # 老版本注册的自启动命令是纯路径（没有 --autostart），这里重写一次做迁移，
+        # 否则开机自启会被当成用户手动打开，又弹出主界面
+        if self.startup_enabled:
+            SystemUtils.set_startup(True)
         # 更新配置文件
         config_manager.set('startup', self.startup_enabled)
         
@@ -206,11 +214,15 @@ class BrightnessManagerApp:
         # 启动系统托盘
         self.setup_tray()
         
-        # 隐藏主窗口，只显示系统托盘
-        self.root.withdraw()
-        
-        # 显示启动通知
-        show_startup_notification("亮度管理器已启动", level='success')
+        # 开机自启动：只留托盘，不弹主界面；用户自己打开 exe：直接显示主界面
+        if self.started_by_autostart:
+            self.root.withdraw()
+            self.log_info("开机自启动：仅显示托盘图标")
+            show_startup_notification("亮度管理器已在托盘运行", level='success')
+        else:
+            self.root.deiconify()
+            self.root.lift()
+            show_startup_notification("亮度管理器已启动", level='success')
         
         # 启动显示器热插拔检测
         self.start_hotplug_detection()
@@ -394,13 +406,24 @@ class BrightnessManagerApp:
         """设置页：开机自启、检查间隔、通知位置"""
         tab = ttk.Frame(self.notebook, padding="14")
         self.notebook.add(tab, text=" 设置 ")
+        # 记住页签对象：托盘左键要直接定位到这一页
+        self.settings_tab = tab
 
         self.startup_var = tk.BooleanVar(value=self.startup_enabled)
         ttk.Checkbutton(
             tab,
-            text="开机自启动",
+            text="开机自启动（自启动时只显示托盘，不弹主界面）",
             variable=self.startup_var,
             command=self.on_startup_change
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        self.show_tray_hint_var = tk.BooleanVar(
+            value=config_manager.get('show_tray_hint', True))
+        ttk.Checkbutton(
+            tab,
+            text="关闭主界面时提示「可在托盘重新打开」",
+            variable=self.show_tray_hint_var,
+            command=self.on_tray_hint_change
         ).pack(anchor=tk.W, pady=(0, 12))
 
         interval_row = ttk.Frame(tab)
@@ -819,35 +842,197 @@ class BrightnessManagerApp:
             self.log_info("启动自动亮度调整定时任务")
             self.start_auto_adjust_timer()
     
+    def _tray_log(self, message, error=None):
+        """把托盘相关过程写到文件，便于无控制台的打包版排查"""
+        try:
+            import traceback
+            text = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
+            if error is not None:
+                text += "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            candidates = [os.path.join(self.data_root, "tray.log")]
+            try:
+                candidates.append(os.path.join(get_executable_path(), "tray.log"))
+            except Exception:
+                pass
+            try:
+                import tempfile
+                candidates.append(os.path.join(tempfile.gettempdir(), "brightness_tray.log"))
+            except Exception:
+                pass
+            for path in candidates:
+                try:
+                    with open(path, "a", encoding="utf-8") as handle:
+                        handle.write(text)
+                    return
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+    def _run_tray(self, tray):
+        """在独立线程里跑 pystray 消息循环"""
+        try:
+            self._tray_log("tray.run starting")
+            # 开机自启时 Explorer 可能还没创建任务栏，太早注册图标会丢失
+            try:
+                import win32gui
+                for _ in range(60):
+                    if win32gui.FindWindow("Shell_TrayWnd", None):
+                        break
+                    time.sleep(0.5)
+                else:
+                    self._tray_log("taskbar not found after wait")
+            except Exception as exc:
+                self._tray_log("wait for taskbar failed", exc)
+            tray.run()
+            self._tray_log("tray.run returned")
+        except Exception as exc:
+            self._tray_log("tray.run failed", exc)
+            self.log_error(f"系统托盘运行失败: {exc}")
+
+    def _ensure_tray_visible(self):
+        """再补一次图标注册，处理 Explorer 重启或注册丢失"""
+        tray = getattr(self, 'tray', None)
+        if tray is None:
+            return
+        try:
+            self._tray_log(f"ensure tray visible: hwnd={getattr(tray, '_hwnd', None)}")
+            if getattr(tray, "_hwnd", None):
+                tray.visible = False
+                tray.visible = True
+                self._tray_log("tray visibility refreshed")
+        except Exception as exc:
+            self._tray_log("refresh tray visibility failed", exc)
+
+    def _patch_pystray_message_filter(self):
+        """让 ChangeWindowMessageFilterEx 失败时不至于整个托盘都创建失败
+
+        这个调用只是为了让 Explorer 重启后仍能把图标加回来；在受限令牌或沙箱里
+        会返回 Access Denied，pystray 默认会把它当致命错误。
+        """
+        try:
+            from pystray._util import win32 as pystray_win32
+            original = getattr(pystray_win32, "ChangeWindowMessageFilterEx", None)
+            if original is None or getattr(original, "_dsh_patched", False):
+                return
+            def safe_change(hwnd, message, action, change_filter_struct):
+                try:
+                    return original(hwnd, message, action, change_filter_struct)
+                except Exception:
+                    return True
+            safe_change._dsh_patched = True
+            pystray_win32.ChangeWindowMessageFilterEx = safe_change
+            self._tray_log("patched ChangeWindowMessageFilterEx")
+        except Exception as exc:
+            self._tray_log("patch ChangeWindowMessageFilterEx failed", exc)
+
+    def _token_integrity_level(self):
+        """返回当前进程令牌的完整性级别 RID，取不到时返回 None
+
+        沙箱、受限令牌或部分安全软件会把进程降权到 Low（0x1000）。这种进程
+        调用 Shell_NotifyIcon 注册托盘图标时会被系统直接拒绝。
+        """
+        try:
+            import win32security
+            handle = win32api.GetCurrentProcess()
+            token = win32security.OpenProcessToken(handle, win32security.TOKEN_QUERY)
+            try:
+                sid = win32security.GetTokenInformation(token, win32security.TokenIntegrityLevel)
+                if isinstance(sid, tuple):
+                    sid = sid[0]
+                return sid.GetSubAuthority(sid.GetSubAuthorityCount() - 1)
+            finally:
+                win32api.CloseHandle(token)
+        except Exception:
+            return None
+
+    def _patch_pystray_shell_notify(self):
+        """记录 Shell_NotifyIcon 的真实返回值
+
+        pystray 不检查这个返回值：在降权/沙箱进程里 NIM_ADD 会失败，但托盘窗口
+        照样建好、visible 也变成 True，日志里看不到任何错误。这里把失败写进
+        tray.log，并在低完整性场景给出明确提示。
+        """
+        try:
+            from pystray._util import win32 as pystray_win32
+            original = pystray_win32.Shell_NotifyIcon
+            if getattr(original, "_dsh_patched", False):
+                return
+
+            def logging_shell_notify(code, data):
+                result = original(code, data)
+                # 只关心 NIM_ADD：图标注册失败才是「看不到托盘」的原因。
+                # NIM_MODIFY 在第一次 NIM_ADD 之前必然失败，属于正常现象。
+                if not result and code == 0:
+                    self._tray_log("Shell_NotifyIcon NIM_ADD 返回失败")
+                    if not getattr(self, "_tray_low_integrity_warned", False):
+                        level = self._token_integrity_level()
+                        if level is not None and level < 0x2000:
+                            self._tray_low_integrity_warned = True
+                            self._tray_log(
+                                "进程完整性级别为 Low（沙箱/降权启动），"
+                                "系统会拒绝注册托盘图标；请用普通用户身份直接运行 exe")
+                return result
+
+            logging_shell_notify._dsh_patched = True
+            pystray_win32.Shell_NotifyIcon = logging_shell_notify
+        except Exception as exc:
+            self._tray_log("patch Shell_NotifyIcon failed", exc)
+
     def setup_tray(self):
         """设置系统托盘"""
         try:
-            # 加载图标
+            self._patch_pystray_message_filter()
+            self._patch_pystray_shell_notify()
+            level = self._token_integrity_level()
+            self._tray_log(f"process integrity={level if level is None else hex(level)}")
+            # 加载图标（copy 一份，避免文件句柄在打包环境里被提前释放）
             try:
                 icon_path = get_resource_path("favicon.ico")
-                icon = Image.open(icon_path)
-            except:
-                # 如果图标不存在或加载失败，创建一个简单的图标
-                icon = Image.new('RGB', (64, 64), color='blue')
+                with Image.open(icon_path) as image:
+                    icon = image.convert("RGBA").copy()
+                self._tray_log(f"icon loaded: {icon_path} size={icon.size}")
+            except Exception as icon_error:
+                self._tray_log("load tray icon failed", icon_error)
+                self.log_warning(f"加载托盘图标失败，使用纯色图标: {icon_error}")
+                icon = Image.new('RGBA', (64, 64), color=(0, 120, 215, 255))
             
             # 创建系统托盘菜单
+            # 菜单回调来自 pystray 线程，统一丢回 Tk 主线程执行，避免跨线程操作 Tk
+            def _on_main_thread(callback):
+                def handler(icon, item):
+                    try:
+                        self.root.after(0, callback)
+                    except Exception as exc:
+                        self._tray_log("tray callback dispatch failed", exc)
+                return handler
+
             menu = pystray.Menu(
                 pystray.MenuItem(
-                    "打开管理界面", 
-                    self.show_gui
+                    "打开管理界面",
+                    _on_main_thread(self.show_gui)
                 ),
                 pystray.MenuItem(
-                    "自动调整亮度", 
-                    self.toggle_auto_brightness,
+                    "自动调整亮度",
+                    _on_main_thread(self.toggle_auto_brightness),
                     checked=lambda item: self.auto_brightness_enabled
                 ),
                 pystray.MenuItem(
-                    "立即调整亮度", 
-                    self.auto_adjust_brightness
+                    "立即调整亮度",
+                    _on_main_thread(self.auto_adjust_brightness)
                 ),
                 pystray.MenuItem(
-                    "退出", 
-                    self.on_exit
+                    "退出",
+                    _on_main_thread(self.on_exit)
+                ),
+                # 左键单击：pystray 在 Windows 上把左键映射到 default 菜单项
+                # （Icon.__call__ 会执行第一个 default=True 的项）。这一项
+                # 不显示在右键菜单里，只用来把左键绑到「设置」页。
+                pystray.MenuItem(
+                    "打开设置界面",
+                    _on_main_thread(self.show_settings),
+                    default=True,
+                    visible=False
                 )
             )
             
@@ -859,21 +1044,39 @@ class BrightnessManagerApp:
                 menu
             )
             
-            # 设置左键点击回调
-            def on_tray_clicked(icon, item):
-                self.show_gui()
-            
-            self.tray.on_clicked = on_tray_clicked
+            # 注意：pystray 0.19 没有 Icon.on_clicked，左键由上面那个
+            # default=True 的隐藏菜单项触发，不要在这里再绑一次。
             
             # 启动系统托盘
-            threading.Thread(target=self.tray.run, daemon=True).start()
+            threading.Thread(target=self._run_tray, args=(self.tray,), daemon=True).start()
+            # 启动完成后补注册两次，处理任务栏尚未就绪/Explorer 重启
+            for delay in (8, 20):
+                timer = threading.Timer(delay, self._ensure_tray_visible)
+                timer.daemon = True
+                timer.start()
+            self.log_info("系统托盘已创建")
         except Exception as e:
+            self._tray_log("setup_tray failed", e)
             self.log_error(f"设置系统托盘失败: {e}")
     
+    def _show_window(self, tab=None):
+        """显示管理窗口；tab 不为空时同时切到该页签"""
+        try:
+            self._close_tray_hint()
+            if tab is not None and getattr(self, 'notebook', None) is not None:
+                self.notebook.select(tab)
+            self.root.deiconify()
+            self.root.lift()
+        except Exception as exc:
+            self._tray_log("show window failed", exc)
+
+    def show_settings(self):
+        """托盘左键：打开管理界面并停在「设置」页"""
+        self._show_window(tab=getattr(self, 'settings_tab', None))
+
     def show_gui(self):
         """显示GUI界面"""
-        self.root.deiconify()
-        self.root.lift()
+        self._show_window()
         
         # 检查模型是否正在加载
         if self.model_loading:
@@ -887,11 +1090,85 @@ class BrightnessManagerApp:
     def hide_gui(self):
         """隐藏GUI界面"""
         self.root.withdraw()
-    
+
+    def _close_tray_hint(self):
+        """关掉还开着的托盘提示窗"""
+        win = getattr(self, '_tray_hint_win', None)
+        if win is None:
+            return
+        self._tray_hint_win = None
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    def _show_tray_hint(self):
+        """关闭主界面后的提示：程序还在托盘里，左键点图标可以重新打开
+
+        勾选「不再提醒」会写进配置（设置页里可以重新打开）。
+        """
+        if not config_manager.get('show_tray_hint', True):
+            return
+        self._close_tray_hint()
+        try:
+            bg = '#1f1f1f'
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes('-topmost', True)
+            win.configure(bg=bg)
+
+            tk.Label(
+                win,
+                text="亮度管理器已最小化到托盘。\n左键点击托盘图标可以重新打开主界面。",
+                bg=bg, fg='#f2f2f2', font=("Microsoft YaHei", 10),
+                justify=tk.LEFT, anchor='w', padx=14, pady=10
+            ).pack(fill=tk.X)
+
+            row = tk.Frame(win, bg=bg)
+            row.pack(fill=tk.X, padx=12, pady=(0, 10))
+
+            dont_remind = tk.BooleanVar(master=win, value=False)
+            tk.Checkbutton(
+                row, text="不再提醒", variable=dont_remind,
+                bg=bg, fg='#c9c9c9', activebackground=bg,
+                activeforeground='#ffffff', selectcolor='#2b2b2b',
+                bd=0, highlightthickness=0, font=("Microsoft YaHei", 9)
+            ).pack(side=tk.LEFT)
+
+            def _close():
+                try:
+                    if dont_remind.get():
+                        config_manager.set('show_tray_hint', False)
+                        if getattr(self, 'show_tray_hint_var', None) is not None:
+                            self.show_tray_hint_var.set(False)
+                        self.log_info("已关闭「关闭主界面时的托盘提示」")
+                except Exception as exc:
+                    self._tray_log("save tray hint flag failed", exc)
+                self._close_tray_hint()
+
+            tk.Button(
+                row, text="知道了", command=_close,
+                bg='#3a6df0', fg='#ffffff', activebackground='#325fd0',
+                activeforeground='#ffffff', bd=0, padx=12, pady=2,
+                font=("Microsoft YaHei", 9), cursor='hand2'
+            ).pack(side=tk.RIGHT)
+
+            win.update_idletasks()
+            width = win.winfo_width()
+            height = win.winfo_height()
+            x = max(0, win.winfo_screenwidth() - width - 24)
+            y = max(0, win.winfo_screenheight() - height - 72)
+            win.geometry(f"+{x}+{y}")
+            # 不点也会自己消失，避免挡着别的窗口
+            win.after(12000, _close)
+            self._tray_hint_win = win
+        except Exception as exc:
+            self._tray_log("show tray hint failed", exc)
+
     def on_window_close(self):
-        """窗口关闭事件处理"""
-        # 隐藏主窗口到系统托盘
+        """窗口关闭事件处理：隐藏到托盘，并按设置提示怎么再打开"""
         self.hide_gui()
+        self._show_tray_hint()
     
     # ------------------------------------------------------------------
     # 亮度应用与训练
@@ -1532,6 +1809,12 @@ class BrightnessManagerApp:
             self.log_error("设置开机自启动失败")
             # 使用 Tkinter 的 after 方法在主线程显示通知
             self.root.after(0, lambda: show_window_notification("设置开机自启动失败", position=self.notification_position, level='error'))
+
+    def on_tray_hint_change(self):
+        """「关闭主界面时提示」开关"""
+        enabled = self.show_tray_hint_var.get()
+        config_manager.set('show_tray_hint', enabled)
+        self.log_info("关闭主界面的托盘提示已" + ("开启" if enabled else "关闭"))
     
     def on_interval_change(self, event):
         """循环检查间隔变化回调"""
