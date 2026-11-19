@@ -38,3 +38,5 @@ env/
 *.db
 *.sqlite
 *.npz
+!brightness_model.npz
+!source/brightness_model.npz
